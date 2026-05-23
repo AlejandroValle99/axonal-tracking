@@ -1,0 +1,27 @@
+[project]
+name = "axonal-tracking"
+version = "0.1.0"
+description = "Automatización del seguimiento de transporte axonal en neuronas hipocampales"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy",
+    "tifffile",        # lectura de kymografos TIF 16-bit
+    "pillow",          # manipulación de imágenes
+    "matplotlib",      # visualización
+    "read-roi",        # lectura de archivos ROI de ImageJ
+    "openpyxl",        # lectura de Excel (ground truth manual)
+    "pandas",          # manejo de datos tabulares
+    "scikit-image",    # procesamiento de imágenes
+    "scipy",           # gaussian_filter para sustracción de fondo
+    "ipywidgets",      # slider interactivo para visor de video en notebooks
+    "torch",           # PyTorch (requerido por SAM2/SAM3)
+    "torchvision",     # utilidades de visión para PyTorch
+    "transformers>=4.57", # Hugging Face — provee SAM3 (Sam3Model / Sam3Processor)
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "ipykernel",
+]
