@@ -18,6 +18,7 @@ dependencies = [
     "torch",           # PyTorch (requerido por SAM2/SAM3)
     "torchvision",     # utilidades de visión para PyTorch
     "transformers>=4.57", # Hugging Face — provee SAM3 (Sam3Model / Sam3Processor)
+    "pyyaml",          # configuracion compartida entre notebooks (data/configuracion_actual.yaml)
 ]
 
 [project.optional-dependencies]

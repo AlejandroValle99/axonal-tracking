@@ -114,36 +114,63 @@ def reducir_ruido(
 
 # ── Sustraccion de fondo temporal ────────────────────────────────────────────
 
-def sustraer_fondo_temporal(
+def calcular_fondo_temporal(
     video: np.ndarray,
     metodo: Literal["mediana", "media"] = "mediana",
 ) -> np.ndarray:
-    """Estima el fondo como un agregado temporal y lo resta de cada frame.
+    """Calcula el fondo estatico de un video colapsando el eje temporal.
 
-    Las vesiculas se MUEVEN entre frames, asi que al colapsar el video con
-    una mediana temporal, las vesiculas casi desaparecen y queda solo lo
-    estatico (soma, agregados pegados, fluorescencia de fondo). Restando esa
-    estimacion, sobreviven los objetos en movimiento.
+    El resultado es una imagen 2D que representa lo que esta "siempre" en cada
+    pixel — el soma, agregados pegados, fluorescencia difusa. Es lo que despues
+    se resta de cada frame para dejar solo lo que se mueve.
 
-    Es el complemento de `sustraer_fondo_espacial`: la espacial mata el soma
-    y los gradientes; la temporal mata los agregados estaticos.
+    Util cuando queres calcular el fondo UNA VEZ y aplicarlo a varios frames
+    del mismo video (mas eficiente que llamar a `sustraer_fondo_temporal`
+    en cada frame).
 
     Parametros:
         video: array 3D (T, H, W).
         metodo: "mediana" (default, mas robusta) o "media".
 
     Devuelve:
-        Array 3D float64 (T, H, W) con cada frame limpio (sin valores negativos).
+        Array 2D (H, W) float64 con el fondo estatico.
     """
     if video.ndim != 3:
         raise ValueError(f"video debe ser 3D (T, H, W); recibido shape {video.shape}")
     v = video.astype(np.float64)
     if metodo == "mediana":
-        fondo = np.median(v, axis=0)
-    elif metodo == "media":
-        fondo = v.mean(axis=0)
-    else:
-        raise ValueError(f"metodo desconocido: {metodo!r}; usar 'mediana' o 'media'")
+        return np.median(v, axis=0)
+    if metodo == "media":
+        return v.mean(axis=0)
+    raise ValueError(f"metodo desconocido: {metodo!r}; usar 'mediana' o 'media'")
+
+
+def sustraer_fondo_temporal(
+    video: np.ndarray,
+    metodo: Literal["mediana", "media"] = "mediana",
+) -> np.ndarray:
+    """Estima el fondo como agregado temporal y lo resta de cada frame.
+
+    Es la version "todo en uno" de `calcular_fondo_temporal` + resta. Devuelve
+    un video 3D limpio (cada frame sin el fondo estatico).
+
+    Las vesiculas se MUEVEN entre frames, asi que al colapsar el video con una
+    mediana temporal las vesiculas casi desaparecen y queda solo lo estatico
+    (soma, agregados pegados, fluorescencia de fondo). Restando esa estimacion,
+    sobreviven los objetos en movimiento.
+
+    Es el complemento de `sustraer_fondo_espacial`: la espacial mata el soma y
+    los gradientes; la temporal mata los agregados estaticos.
+
+    Parametros:
+        video: array 3D (T, H, W).
+        metodo: "mediana" (default, mas robusta) o "media".
+
+    Devuelve:
+        Array 3D float64 (T, H, W) con cada frame limpio.
+    """
+    fondo = calcular_fondo_temporal(video, metodo=metodo)
+    v = video.astype(np.float64)
     return np.clip(v - fondo[None], 0.0, None)
 
 
@@ -216,6 +243,7 @@ def aplicar_mascara(frame: np.ndarray, mascara: np.ndarray) -> np.ndarray:
 def pipeline_frame(
     frame_u16: np.ndarray,
     *,
+    fondo_temporal: np.ndarray | None = None,
     sigma_fondo: float = 20.0,
     sigma_ruido: float = 0.8,
     ruta_roi: Path | None = None,
@@ -225,16 +253,20 @@ def pipeline_frame(
 
     Pasos en orden:
       1. crudo                  -> frame uint16 original
-      2. sin_fondo              -> tras sustraer fondo espacial
-      3. sin_ruido              -> tras filtro gaussiano leve
-      4. enmascarado            -> tras aplicar ROI (igual a sin_ruido si no hay ROI)
-      5. rgb_uint8              -> conversion final para SAM/detectores
-      6. mascara_roi            -> la mascara binaria usada (o None)
-
-    Es util para visualizar cada etapa y debuggear.
+      2. sin_fondo_temporal     -> tras restar el fondo temporal (None si no se paso)
+      3. sin_fondo              -> tras sustraer fondo espacial
+      4. sin_ruido              -> tras filtro gaussiano leve
+      5. enmascarado            -> tras aplicar ROI (igual a sin_ruido si no hay ROI)
+      6. rgb_uint8              -> conversion final para SAM/detectores
+      7. mascara_roi            -> la mascara binaria usada (o None)
 
     Parametros:
         frame_u16: frame crudo (2D uint16).
+        fondo_temporal: array 2D (H, W) con el fondo estatico del video, calculado
+            con `calcular_fondo_temporal()`. Si se pasa, se resta antes de la
+            sustraccion espacial — elimina objetos estaticos (agregados, debris).
+            Pasalo si vas a procesar varios frames del mismo video (se calcula
+            una vez y se reutiliza).
         sigma_fondo: sigma para gaussian de sustraccion de fondo espacial.
         sigma_ruido: sigma para gaussian de reduccion de ruido.
         ruta_roi: path al .roi del axon (opcional). Si es None, no se enmascara.
@@ -244,9 +276,24 @@ def pipeline_frame(
         Dict con todos los pasos intermedios.
     """
     crudo = frame_u16
-    sin_fondo = sustraer_fondo_espacial(crudo, sigma=sigma_fondo)
+
+    # 1. Sustraccion temporal (opcional, si se paso fondo_temporal).
+    if fondo_temporal is not None:
+        sin_fondo_temporal = np.clip(
+            crudo.astype(np.float64) - fondo_temporal, 0.0, None
+        )
+        entrada_espacial = sin_fondo_temporal
+    else:
+        sin_fondo_temporal = None
+        entrada_espacial = crudo
+
+    # 2. Sustraccion espacial.
+    sin_fondo = sustraer_fondo_espacial(entrada_espacial, sigma=sigma_fondo)
+
+    # 3. Ruido.
     sin_ruido = reducir_ruido(sin_fondo, metodo="gaussian", sigma=sigma_ruido)
 
+    # 4. Mascara ROI (opcional).
     mascara = None
     enmascarado = sin_ruido
     if ruta_roi is not None:
@@ -254,17 +301,164 @@ def pipeline_frame(
         if mascara is not None:
             enmascarado = aplicar_mascara(sin_ruido, mascara)
 
-    # La conversion a RGB uint8 se hace sobre el frame enmascarado: lo que
-    # llega a los modelos es lo mas limpio posible. Si hubo enmascarado,
-    # ignoramos los ceros del fondo al calcular el stretch — si no, el axon
-    # se satura en blanco uniforme y se pierde el contraste interno.
+    # 5. RGB uint8 para SAM/detectores. Si hubo enmascarado, ignoramos los ceros
+    # del fondo al calcular el stretch — si no, el axon se satura en blanco
+    # uniforme y se pierde el contraste interno.
     rgb_uint8 = frame_a_rgb_uint8(enmascarado, ignorar_ceros=(mascara is not None))
 
     return {
         "crudo": crudo,
+        "sin_fondo_temporal": sin_fondo_temporal,
         "sin_fondo": sin_fondo,
         "sin_ruido": sin_ruido,
         "enmascarado": enmascarado,
         "rgb_uint8": rgb_uint8,
         "mascara_roi": mascara,
     }
+
+
+def bbox_de_mascara(mascara: np.ndarray, padding: int = 20) -> tuple[int, int, int, int]:
+    """Calcula el bounding box (y0, y1, x0, x1) de una mascara binaria, con padding.
+
+    Util para recortar el frame al area util (la del axon) y descartar todo el
+    fondo enmascarado. Reduce memoria y compute al alimentar a los modelos
+    sin perder resolucion de las particulas chicas.
+
+    Parametros:
+        mascara: array 2D bool.
+        padding: pixeles a expandir el bbox en cada direccion (clipea al frame).
+
+    Devuelve:
+        (y0, y1, x0, x1) con y0/x0 inclusivos y y1/x1 exclusivos (estilo numpy).
+        Si la mascara esta vacia, devuelve el frame entero.
+    """
+    H, W = mascara.shape
+    if not mascara.any():
+        return (0, H, 0, W)
+    ys, xs = np.where(mascara)
+    y0 = max(0, int(ys.min()) - padding)
+    y1 = min(H, int(ys.max()) + 1 + padding)
+    x0 = max(0, int(xs.min()) - padding)
+    x1 = min(W, int(xs.max()) + 1 + padding)
+    return (y0, y1, x0, x1)
+
+
+def recortar_a_bbox(arr: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
+    """Recorta un array (2D, 3D o 4D) a la bbox (y0, y1, x0, x1).
+
+    Soporta:
+      - (H, W)       — un frame en escala de grises
+      - (H, W, C)    — un frame RGB
+      - (T, H, W)    — un video monocanal
+      - (T, H, W, C) — un video RGB
+
+    El recorte siempre actua sobre los ejes H y W (los espaciales).
+    """
+    y0, y1, x0, x1 = bbox
+    if arr.ndim == 2:
+        return arr[y0:y1, x0:x1]
+    if arr.ndim == 3:
+        # Distinguir (H, W, C) vs (T, H, W). Asumimos que (H, W, C) tiene el
+        # ultimo eje <= 4 (canales RGB/RGBA) y (T, H, W) tiene mas.
+        if arr.shape[-1] <= 4:
+            return arr[y0:y1, x0:x1, :]
+        return arr[:, y0:y1, x0:x1]
+    if arr.ndim == 4:
+        return arr[:, y0:y1, x0:x1, :]
+    raise ValueError(f"shape no soportado: {arr.shape}")
+
+
+def recortar_pasos_pipeline(
+    pasos: dict,
+    padding: int = 20,
+) -> dict:
+    """Recorta todos los arrays del dict de `pipeline_frame()` al bbox del ROI.
+
+    Si no hay mascara en `pasos`, devuelve el dict tal cual. Si la hay, recorta
+    cada array al bbox de la mascara con el padding pedido. El bbox queda
+    guardado como `pasos["bbox"]` para mapear coordenadas a la imagen original.
+
+    Parametros:
+        pasos: dict devuelto por `pipeline_frame()`.
+        padding: pixeles de margen alrededor del bbox del ROI.
+
+    Devuelve:
+        Dict con los mismos keys, todos los arrays recortados, + `bbox`.
+    """
+    mascara = pasos.get("mascara_roi")
+    if mascara is None:
+        return {**pasos, "bbox": None}
+
+    bbox = bbox_de_mascara(mascara, padding=padding)
+    out = {}
+    for k, v in pasos.items():
+        if v is None or not isinstance(v, np.ndarray):
+            out[k] = v
+        else:
+            out[k] = recortar_a_bbox(v, bbox)
+    out["bbox"] = bbox
+    return out
+
+
+def pipeline_video(
+    video: np.ndarray,
+    *,
+    fondo_temporal: np.ndarray | None = None,
+    sigma_fondo: float = 20.0,
+    sigma_ruido: float = 0.8,
+    ruta_roi: Path | None = None,
+    ancho_roi_px: int = 8,
+) -> np.ndarray:
+    """Aplica el pipeline completo a cada frame del video.
+
+    Es equivalente a llamar `pipeline_frame()` en cada frame, pero mucho mas
+    eficiente: calcula la mascara del ROI y el fondo temporal UNA sola vez y
+    los reutiliza para todos los frames.
+
+    Parametros:
+        video: array 3D (T, H, W) uint16.
+        fondo_temporal: array 2D (H, W) con el fondo estatico. Si es None, se
+            calcula desde el mismo video como mediana temporal (recomendado).
+        sigma_fondo, sigma_ruido: ver `pipeline_frame`.
+        ruta_roi: path al .roi del axon (opcional).
+        ancho_roi_px: ancho de la mascara del axon.
+
+    Devuelve:
+        Array 4D (T, H, W, 3) uint8 con cada frame procesado y listo para SAM.
+
+    Memoria: 86 frames * 1148 * 1279 * 3 bytes = ~378 MB para los videos del lab.
+    """
+    if video.ndim != 3:
+        raise ValueError(f"video debe ser 3D (T, H, W); recibido {video.shape}")
+
+    # Calcular fondo temporal una sola vez si no se paso.
+    if fondo_temporal is None:
+        fondo_temporal = calcular_fondo_temporal(video, metodo="mediana")
+
+    # Cargar la mascara del ROI una sola vez si se paso.
+    H, W = video.shape[1], video.shape[2]
+    mascara = None
+    if ruta_roi is not None:
+        mascara = cargar_mascara_roi(ruta_roi, shape=(H, W), ancho_px=ancho_roi_px)
+
+    T = video.shape[0]
+    salida = np.empty((T, H, W, 3), dtype=np.uint8)
+
+    for t in range(T):
+        frame_u16 = video[t]
+
+        # Sustraccion temporal
+        sin_fondo_t = np.clip(frame_u16.astype(np.float64) - fondo_temporal, 0.0, None)
+
+        # Espacial + ruido
+        sin_fondo = sustraer_fondo_espacial(sin_fondo_t, sigma=sigma_fondo)
+        sin_ruido = reducir_ruido(sin_fondo, metodo="gaussian", sigma=sigma_ruido)
+
+        # Mascara (opcional)
+        if mascara is not None:
+            sin_ruido = aplicar_mascara(sin_ruido, mascara)
+
+        # RGB uint8
+        salida[t] = frame_a_rgb_uint8(sin_ruido, ignorar_ceros=(mascara is not None))
+
+    return salida

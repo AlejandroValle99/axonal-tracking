@@ -185,6 +185,87 @@ def dibujar_cajas(
     ax.axis("off")
 
 
+def mostrar_strip_en_chunks(
+    strip,
+    chunk_width: int = 300,
+    espacio_entre_chunks: int = 4,
+    titulo: str = "",
+    ax=None,
+    figsize_escala: float = 80,
+    cmap: str = "gray",
+    percentiles: tuple[float, float] = (1.0, 99.0),
+    ignorar_ceros: bool = False,
+):
+    """Muestra un strip rectificado (extremo horizontal) en filas apiladas 1:1.
+
+    Un strip de (H, W) muy alargado se ve estirado con `aspect='auto'`. Esta
+    funcion lo corta en N chunks de `chunk_width` pixeles, los apila
+    verticalmente con un separador, y los muestra con aspecto real — las
+    particulas se ven redondas en vez de comprimidas.
+
+    Soporta strips 2D (H, W) o RGB (H, W, 3).
+
+    Parametros:
+        strip: array (H, W) o (H, W, 3).
+        chunk_width: ancho de cada chunk en pixeles.
+        espacio_entre_chunks: pixeles de separador entre chunks.
+        titulo: titulo opcional.
+        ax: matplotlib Axes; si None, crea figura con tamano auto.
+        figsize_escala: pixeles por pulgada usados para autosize.
+        cmap, percentiles, ignorar_ceros: solo para strips 2D.
+    """
+    strip = np.asarray(strip)
+    es_rgb = strip.ndim == 3 and strip.shape[-1] in (3, 4)
+    H, W = strip.shape[:2]
+
+    n_chunks = (W + chunk_width - 1) // chunk_width
+    W_total = n_chunks * chunk_width
+    pad = W_total - W
+    if pad > 0:
+        if es_rgb:
+            strip = np.pad(strip, ((0, 0), (0, pad), (0, 0)), constant_values=0)
+        else:
+            strip = np.pad(strip, ((0, 0), (0, pad)), constant_values=0)
+
+    # (H, n_chunks * chunk_width [, C]) -> (n_chunks, H, chunk_width [, C])
+    if es_rgb:
+        chunks = strip.reshape(H, n_chunks, chunk_width, strip.shape[-1]).transpose(1, 0, 2, 3)
+        sep_shape = (espacio_entre_chunks, chunk_width, strip.shape[-1])
+    else:
+        chunks = strip.reshape(H, n_chunks, chunk_width).transpose(1, 0, 2)
+        sep_shape = (espacio_entre_chunks, chunk_width)
+
+    sep = np.zeros(sep_shape, dtype=strip.dtype)
+    rows = []
+    for i, chunk in enumerate(chunks):
+        if i > 0:
+            rows.append(sep)
+        rows.append(chunk)
+    composite = np.vstack(rows)
+
+    if ax is None:
+        H_comp = composite.shape[0]
+        W_comp = composite.shape[1]
+        fig, ax = plt.subplots(figsize=(W_comp / figsize_escala, H_comp / figsize_escala))
+
+    if es_rgb:
+        ax.imshow(composite, aspect="equal")
+    else:
+        if ignorar_ceros:
+            no_cero = composite[composite > 0]
+            if no_cero.size > 0:
+                lo, hi = np.percentile(no_cero, list(percentiles))
+            else:
+                lo, hi = 0, 1
+        else:
+            lo, hi = np.percentile(composite, list(percentiles))
+        ax.imshow(composite, cmap=cmap, vmin=lo, vmax=hi, aspect="equal")
+
+    if titulo:
+        ax.set_title(titulo)
+    ax.axis("off")
+
+
 def dibujar_puntos(
     frame_rgb: np.ndarray,
     points_xy,

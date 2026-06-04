@@ -1,0 +1,28 @@
+video:
+  ruta: /Users/alejandrovalle/Desktop/Videos-Kymos-experimental data/Hipocampal neurons
+    transport/N1-11 and 12-09-25/Movies 110925/WTI/Movie_266.vsi
+  roi: /Users/alejandrovalle/Desktop/Videos-Kymos-experimental data/Hipocampal neurons
+    transport/N1-11 and 12-09-25/ROIS y Kymos/110925/WT/266.roi
+frames:
+  inicio: 0
+  fin: null
+  demo: 0
+procesamiento:
+  modo: configurable
+  etapas:
+    fondo_temporal: true
+    fondo_espacial: true
+    ruido: true
+    roi: true
+  parametros:
+    sigma_fondo: 20.0
+    sigma_ruido: 1.2
+    ancho_roi_px: 8
+    n_frames_temporal: 111
+  recorte_roi:
+    habilitado: true
+    padding_px: 20
+  rectificacion:
+    habilitada: true
+    ancho_banda_px: 40
+    paso_px: 1.0
