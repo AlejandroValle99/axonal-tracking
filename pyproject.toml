@@ -19,10 +19,20 @@ dependencies = [
     "torchvision",     # utilidades de visión para PyTorch
     "transformers>=4.57", # Hugging Face — provee SAM3 (Sam3Model / Sam3Processor)
     "pyyaml",          # configuracion compartida entre notebooks (data/configuracion_actual.yaml)
+    "kymobutler[convert]",
 ]
 
 [project.optional-dependencies]
 dev = [
     "jupyter",
     "ipykernel",
+]
+
+[tool.uv.sources]
+kymobutler = { path = "../KymoButler", editable = true }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "nbconvert>=7.17.1",
 ]

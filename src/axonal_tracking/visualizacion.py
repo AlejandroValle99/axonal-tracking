@@ -17,7 +17,7 @@ def mostrar_frame(
     titulo: str = "",
     ax=None,
     cmap: str = "gray",
-    percentiles: tuple[float, float] = (1.0, 99.0),
+    percentiles: tuple[float, float] = (50.0, 99.8),
     ignorar_ceros: bool = False,
 ):
     """Muestra un frame con contraste ajustado por percentiles.
@@ -29,7 +29,10 @@ def mostrar_frame(
         titulo: titulo del subplot.
         ax: eje matplotlib donde dibujar; si es None, crea uno nuevo.
         cmap: colormap (solo aplica a frames 2D).
-        percentiles: rango (low, high) para el stretch de contraste.
+        percentiles: rango (low, high) para el stretch de contraste. Default
+            anclado al fondo (p50-p99.8) — misma ventana que `frame_a_rgb_uint8`,
+            equivale al "contraste y brillo" del lab. Ver esa funcion para el
+            porque. Bajar el piso (ej. (30, 99.8)) para conservar mas fondo.
         ignorar_ceros: si True, calcula los percentiles solo sobre pixeles != 0.
             Usar para frames enmascarados, donde la mayoria de pixeles son 0 y
             distorsionarian el stretch (el contenido visible queda comprimido
@@ -193,7 +196,7 @@ def mostrar_strip_en_chunks(
     ax=None,
     figsize_escala: float = 80,
     cmap: str = "gray",
-    percentiles: tuple[float, float] = (1.0, 99.0),
+    percentiles: tuple[float, float] = (50.0, 99.8),
     ignorar_ceros: bool = False,
 ):
     """Muestra un strip rectificado (extremo horizontal) en filas apiladas 1:1.

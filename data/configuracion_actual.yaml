@@ -16,7 +16,8 @@ procesamiento:
     roi: true
   parametros:
     sigma_fondo: 20.0
-    sigma_ruido: 1.2
+    sigma_ruido: 1.0
+    metodo_espacial: dog
     ancho_roi_px: 8
     n_frames_temporal: 111
   recorte_roi:

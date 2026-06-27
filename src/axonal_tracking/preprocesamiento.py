@@ -24,18 +24,31 @@ from scipy.ndimage import gaussian_filter, median_filter
 
 def frame_a_rgb_uint8(
     frame_u16: np.ndarray,
-    p_low: float = 1.0,
-    p_high: float = 99.0,
+    p_low: float = 50.0,
+    p_high: float = 99.8,
     ignorar_ceros: bool = False,
 ) -> np.ndarray:
     """Convierte un frame uint16 monocanal a RGB uint8 con stretch de percentiles.
 
     Los modelos de vision (SAM, Grounding DINO, etc.) esperan uint8 RGB.
-    El stretch evita perder contraste por outliers (pixeles saturados o muertos).
+    El stretch lineal entre dos percentiles es lo que el lab llama "contraste y
+    brillo": elige un PISO y un TECHO y mapea esa ventana a 0-255.
+
+    Defaults anclados al fondo (p50-p99.8), no (p1-p99):
+        - El piso en p1 caia sobre las esquinas negras del viñeteo (=0), no
+          sobre el fondo difuso de la celula (~p50). Resultado: el fondo
+          quedaba gris/lechoso en vez de negro.
+        - El techo en p99 caia apenas por encima del fondo, asi que las
+          vesiculas brillantes (muy por encima de p99) saturaban todas a
+          blanco y se desperdiciaba el rango dinamico.
+        Anclando el piso al fondo (p50) y el techo cerca del brillo de las
+        vesiculas (p99.8) se reproduce la imagen limpia del lab: fondo a negro,
+        vesiculas brillantes, sin amplificar el ruido del fondo.
+        Para conservar mas contexto de fondo, bajar `p_low` (ej. 30-40).
 
     Parametros:
         frame_u16: array 2D uint16 (alto, ancho).
-        p_low, p_high: percentiles para el stretch (default 1-99).
+        p_low, p_high: percentiles para el stretch (default 50-99.8, ver arriba).
         ignorar_ceros: si True, calcula los percentiles solo sobre pixeles != 0.
             Usar cuando el frame viene enmascarado (la mayoria de pixeles son 0):
             si se incluyen, el stretch se rompe y el contenido visible queda
@@ -110,6 +123,56 @@ def reducir_ruido(
     if metodo == "mediana":
         return median_filter(frame, size=tamano_mediana)
     raise ValueError(f"metodo desconocido: {metodo!r}; usar 'gaussian' o 'mediana'")
+
+
+# ── Band-pass DoG (fondo + ruido en una sola operacion) ──────────────────────
+
+def banda_pasante_dog(
+    frame: np.ndarray,
+    sigma_senal: float = 1.0,
+    sigma_fondo: float = 20.0,
+) -> np.ndarray:
+    """Filtro pasa-banda por Diferencia de Gaussianas (DoG).
+
+    Reemplaza a `sustraer_fondo_espacial` + `reducir_ruido` con UNA sola
+    operacion: resta dos versiones suavizadas del frame.
+
+        DoG = gaussian(frame, sigma_senal) - gaussian(frame, sigma_fondo)
+
+    Intuicion (es un pasa-banda espacial):
+    - `gaussian(sigma_fondo)` (sigma grande) estima el fondo "lento": soma,
+      fluorescencia difusa, gradientes de iluminacion -> se RESTA.
+    - `gaussian(sigma_senal)` (sigma chico ~ tamanio de la vesicula) suaviza el
+      ruido shot-noise de 1 px ANTES de restar -> sobreviven las vesiculas.
+
+    Por que es mejor que el flujo en dos pasos (`sustraer_fondo_espacial` +
+    `reducir_ruido`): aquel resta el fondo del frame CRUDO (arrastra todo el
+    ruido del sensor al residuo) y recien despues suaviza; al clipear en 0 el
+    fondo queda como un piso de ruido (~100% ruido) que el stretch posterior
+    amplifica a grano visible. El DoG suaviza la senal en el mismo paso en que
+    resta el fondo, asi el residuo casi no tiene grano. Es, ademas, la forma
+    canonica de realzar particulas puntuales (lo que aproxima un detector LoG /
+    `blob_log`).
+
+    Parametros:
+        frame: array 2D (uint16 o float).
+        sigma_senal: sigma del gaussian "chico" (escala de la vesicula, ~1 px).
+            Hace de denoise: mas grande suaviza mas pero engorda los blobs.
+        sigma_fondo: sigma del gaussian "grande" (escala del fondo, ~20 px).
+            Igual rol que `sigma` en `sustraer_fondo_espacial`.
+
+    Devuelve:
+        Array float64 con el frame pasa-banda (sin valores negativos).
+    """
+    if sigma_senal >= sigma_fondo:
+        raise ValueError(
+            f"sigma_senal ({sigma_senal}) debe ser < sigma_fondo ({sigma_fondo}) "
+            "para que el DoG sea un pasa-banda"
+        )
+    f = frame.astype(np.float64)
+    senal = gaussian_filter(f, sigma=sigma_senal)
+    fondo = gaussian_filter(f, sigma=sigma_fondo)
+    return np.clip(senal - fondo, 0.0, None)
 
 
 # ── Sustraccion de fondo temporal ────────────────────────────────────────────
@@ -245,7 +308,8 @@ def pipeline_frame(
     *,
     fondo_temporal: np.ndarray | None = None,
     sigma_fondo: float = 20.0,
-    sigma_ruido: float = 0.8,
+    sigma_ruido: float = 1.0,
+    metodo_espacial: Literal["dog", "resta_gauss"] = "dog",
     ruta_roi: Path | None = None,
     ancho_roi_px: int = 8,
 ) -> dict:
@@ -254,8 +318,8 @@ def pipeline_frame(
     Pasos en orden:
       1. crudo                  -> frame uint16 original
       2. sin_fondo_temporal     -> tras restar el fondo temporal (None si no se paso)
-      3. sin_fondo              -> tras sustraer fondo espacial
-      4. sin_ruido              -> tras filtro gaussiano leve
+      3. sin_fondo              -> tras la limpieza espacial (ver `metodo_espacial`)
+      4. sin_ruido              -> tras el denoise (en "dog" es igual a sin_fondo)
       5. enmascarado            -> tras aplicar ROI (igual a sin_ruido si no hay ROI)
       6. rgb_uint8              -> conversion final para SAM/detectores
       7. mascara_roi            -> la mascara binaria usada (o None)
@@ -264,11 +328,19 @@ def pipeline_frame(
         frame_u16: frame crudo (2D uint16).
         fondo_temporal: array 2D (H, W) con el fondo estatico del video, calculado
             con `calcular_fondo_temporal()`. Si se pasa, se resta antes de la
-            sustraccion espacial — elimina objetos estaticos (agregados, debris).
+            limpieza espacial — elimina objetos estaticos (agregados, debris).
             Pasalo si vas a procesar varios frames del mismo video (se calcula
             una vez y se reutiliza).
-        sigma_fondo: sigma para gaussian de sustraccion de fondo espacial.
-        sigma_ruido: sigma para gaussian de reduccion de ruido.
+        sigma_fondo: sigma del gaussian "grande" (escala del fondo).
+        sigma_ruido: sigma del gaussian "chico" (denoise / escala de la senal).
+            En "dog" es el `sigma_senal` del pasa-banda; en "resta_gauss" es el
+            sigma del filtro de ruido posterior.
+        metodo_espacial: como se combina fondo + ruido.
+            - "dog" (default): pasa-banda por Diferencia de Gaussianas en UNA
+              operacion (`banda_pasante_dog`). Menos grano. Recomendado.
+            - "resta_gauss": flujo clasico en dos pasos
+              (`sustraer_fondo_espacial` + `reducir_ruido`). Conservado para
+              comparacion / compatibilidad.
         ruta_roi: path al .roi del axon (opcional). Si es None, no se enmascara.
         ancho_roi_px: ancho de la mascara del axon en pixeles.
 
@@ -287,11 +359,20 @@ def pipeline_frame(
         sin_fondo_temporal = None
         entrada_espacial = crudo
 
-    # 2. Sustraccion espacial.
-    sin_fondo = sustraer_fondo_espacial(entrada_espacial, sigma=sigma_fondo)
-
-    # 3. Ruido.
-    sin_ruido = reducir_ruido(sin_fondo, metodo="gaussian", sigma=sigma_ruido)
+    # 2-3. Limpieza espacial (fondo + ruido).
+    if metodo_espacial == "dog":
+        # El DoG resta el fondo y suaviza la senal en una sola pasada.
+        sin_fondo = banda_pasante_dog(
+            entrada_espacial, sigma_senal=sigma_ruido, sigma_fondo=sigma_fondo
+        )
+        sin_ruido = sin_fondo  # ya viene denoised; mantenemos la clave estable
+    elif metodo_espacial == "resta_gauss":
+        sin_fondo = sustraer_fondo_espacial(entrada_espacial, sigma=sigma_fondo)
+        sin_ruido = reducir_ruido(sin_fondo, metodo="gaussian", sigma=sigma_ruido)
+    else:
+        raise ValueError(
+            f"metodo_espacial desconocido: {metodo_espacial!r}; usar 'dog' o 'resta_gauss'"
+        )
 
     # 4. Mascara ROI (opcional).
     mascara = None
@@ -405,7 +486,8 @@ def pipeline_video(
     *,
     fondo_temporal: np.ndarray | None = None,
     sigma_fondo: float = 20.0,
-    sigma_ruido: float = 0.8,
+    sigma_ruido: float = 1.0,
+    metodo_espacial: Literal["dog", "resta_gauss"] = "dog",
     ruta_roi: Path | None = None,
     ancho_roi_px: int = 8,
 ) -> np.ndarray:
@@ -419,7 +501,7 @@ def pipeline_video(
         video: array 3D (T, H, W) uint16.
         fondo_temporal: array 2D (H, W) con el fondo estatico. Si es None, se
             calcula desde el mismo video como mediana temporal (recomendado).
-        sigma_fondo, sigma_ruido: ver `pipeline_frame`.
+        sigma_fondo, sigma_ruido, metodo_espacial: ver `pipeline_frame`.
         ruta_roi: path al .roi del axon (opcional).
         ancho_roi_px: ancho de la mascara del axon.
 
@@ -450,9 +532,18 @@ def pipeline_video(
         # Sustraccion temporal
         sin_fondo_t = np.clip(frame_u16.astype(np.float64) - fondo_temporal, 0.0, None)
 
-        # Espacial + ruido
-        sin_fondo = sustraer_fondo_espacial(sin_fondo_t, sigma=sigma_fondo)
-        sin_ruido = reducir_ruido(sin_fondo, metodo="gaussian", sigma=sigma_ruido)
+        # Espacial + ruido (DoG en una pasada, o el flujo clasico en dos)
+        if metodo_espacial == "dog":
+            sin_ruido = banda_pasante_dog(
+                sin_fondo_t, sigma_senal=sigma_ruido, sigma_fondo=sigma_fondo
+            )
+        elif metodo_espacial == "resta_gauss":
+            sin_fondo = sustraer_fondo_espacial(sin_fondo_t, sigma=sigma_fondo)
+            sin_ruido = reducir_ruido(sin_fondo, metodo="gaussian", sigma=sigma_ruido)
+        else:
+            raise ValueError(
+                f"metodo_espacial desconocido: {metodo_espacial!r}; usar 'dog' o 'resta_gauss'"
+            )
 
         # Mascara (opcional)
         if mascara is not None:

@@ -51,7 +51,13 @@ CONFIG_DEFECTO: dict = {
         },
         "parametros": {
             "sigma_fondo": 20.0,
-            "sigma_ruido": 0.8,
+            "sigma_ruido": 1.0,
+            # Como se limpia el fondo espacial + ruido:
+            #   "dog"         -> pasa-banda Diferencia de Gaussianas (1 pasada,
+            #                    menos grano; recomendado).
+            #   "resta_gauss" -> flujo clasico en dos pasos (resta gaussiana +
+            #                    filtro de ruido). Conservado para comparacion.
+            "metodo_espacial": "dog",
             "ancho_roi_px": 8,
             "n_frames_temporal": 10,
         },
@@ -161,6 +167,16 @@ def _ruta_roi_si_activada(config: dict) -> Path | None:
     return roi if roi.exists() else None
 
 
+def _metodo_espacial_config(config: dict) -> str:
+    """Lee `procesamiento.parametros.metodo_espacial` ('dog' | 'resta_gauss').
+
+    Default "dog" (recomendado). Backward compat: configs viejos sin la clave
+    tambien usan "dog".
+    """
+    params = config.get("procesamiento", {}).get("parametros", {})
+    return str(params.get("metodo_espacial", "dog"))
+
+
 def _recorte_roi_config(config: dict) -> tuple[bool, int]:
     """Lee (habilitado, padding_px) de la seccion `recorte_roi` del config.
 
@@ -211,6 +227,7 @@ def aplicar_modo_frame(
     proc = config["procesamiento"]
     modo = proc["modo"]
     params = proc["parametros"]
+    metodo_espacial = _metodo_espacial_config(config)
 
     if modo == "rgb_crudo":
         rgb = pp.frame_a_rgb_uint8(frame_u16)
@@ -229,6 +246,7 @@ def aplicar_modo_frame(
             fondo_temporal=fondo_temporal,
             sigma_fondo=params["sigma_fondo"],
             sigma_ruido=params["sigma_ruido"],
+            metodo_espacial=metodo_espacial,
             ruta_roi=_ruta_roi_si_activada(config),
             ancho_roi_px=params["ancho_roi_px"],
         )
@@ -240,6 +258,7 @@ def aplicar_modo_frame(
             fondo_temporal=ft,
             usar_fondo_espacial=etapas.get("fondo_espacial", True),
             usar_ruido=etapas.get("ruido", True),
+            metodo_espacial=metodo_espacial,
             ruta_roi=_ruta_roi_si_activada(config),
             sigma_fondo=params["sigma_fondo"],
             sigma_ruido=params["sigma_ruido"],
@@ -347,6 +366,7 @@ def aplicar_modo_video(video_u16: np.ndarray, config: dict):
     proc = config["procesamiento"]
     modo = proc["modo"]
     params = proc["parametros"]
+    metodo_espacial = _metodo_espacial_config(config)
 
     if modo == "rgb_crudo":
         T, H, W = video_u16.shape
@@ -359,6 +379,7 @@ def aplicar_modo_video(video_u16: np.ndarray, config: dict):
             video_u16,
             sigma_fondo=params["sigma_fondo"],
             sigma_ruido=params["sigma_ruido"],
+            metodo_espacial=metodo_espacial,
             ruta_roi=_ruta_roi_si_activada(config),
             ancho_roi_px=params["ancho_roi_px"],
         )
@@ -381,6 +402,7 @@ def aplicar_modo_video(video_u16: np.ndarray, config: dict):
                 fondo_temporal=fondo_temporal,
                 usar_fondo_espacial=etapas.get("fondo_espacial", True),
                 usar_ruido=etapas.get("ruido", True),
+                metodo_espacial=metodo_espacial,
                 ruta_roi=_ruta_roi_si_activada(config),
                 sigma_fondo=params["sigma_fondo"],
                 sigma_ruido=params["sigma_ruido"],
@@ -455,9 +477,18 @@ def _pipeline_configurable(
     sigma_fondo: float,
     sigma_ruido: float,
     ancho_roi_px: int,
+    metodo_espacial: str = "dog",
 ) -> dict:
     """Aplica el pipeline saltando etapas segun flags. Devuelve el mismo
-    diccionario de pasos que `pp.pipeline_frame` para mantener la API estable."""
+    diccionario de pasos que `pp.pipeline_frame` para mantener la API estable.
+
+    `metodo_espacial`:
+      - "dog": la etapa espacial es un pasa-banda DoG (fondo + ruido en una
+        pasada). `usar_fondo_espacial` la prende/apaga; el flag `usar_ruido`
+        no aplica (el DoG ya suaviza).
+      - "resta_gauss": flujo clasico — `usar_fondo_espacial` (resta gaussiana)
+        y `usar_ruido` (filtro gaussiano) son dos toggles independientes.
+    """
     crudo = frame_u16
 
     if fondo_temporal is not None:
@@ -467,15 +498,28 @@ def _pipeline_configurable(
         sin_fondo_temporal = None
         entrada = crudo
 
-    if usar_fondo_espacial:
-        sin_fondo = pp.sustraer_fondo_espacial(entrada, sigma=sigma_fondo)
-    else:
-        sin_fondo = entrada.astype(np.float64) if entrada.dtype != np.float64 else entrada
+    if metodo_espacial == "dog":
+        if usar_fondo_espacial:
+            sin_fondo = pp.banda_pasante_dog(
+                entrada, sigma_senal=sigma_ruido, sigma_fondo=sigma_fondo
+            )
+        else:
+            sin_fondo = entrada.astype(np.float64) if entrada.dtype != np.float64 else entrada
+        sin_ruido = sin_fondo  # el DoG ya hace denoise
+    elif metodo_espacial == "resta_gauss":
+        if usar_fondo_espacial:
+            sin_fondo = pp.sustraer_fondo_espacial(entrada, sigma=sigma_fondo)
+        else:
+            sin_fondo = entrada.astype(np.float64) if entrada.dtype != np.float64 else entrada
 
-    if usar_ruido:
-        sin_ruido = pp.reducir_ruido(sin_fondo, metodo="gaussian", sigma=sigma_ruido)
+        if usar_ruido:
+            sin_ruido = pp.reducir_ruido(sin_fondo, metodo="gaussian", sigma=sigma_ruido)
+        else:
+            sin_ruido = sin_fondo
     else:
-        sin_ruido = sin_fondo
+        raise ValueError(
+            f"metodo_espacial desconocido: {metodo_espacial!r}; usar 'dog' o 'resta_gauss'"
+        )
 
     mascara = None
     enmascarado = sin_ruido
