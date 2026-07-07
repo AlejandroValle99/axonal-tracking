@@ -20,6 +20,8 @@ dependencies = [
     "transformers>=4.57", # Hugging Face — provee SAM3 (Sam3Model / Sam3Processor)
     "pyyaml",          # configuracion compartida entre notebooks (data/configuracion_actual.yaml)
     "kymobutler[convert]",
+    "synthkymo",
+    "scikit-learn>=1.9.0",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +32,7 @@ dev = [
 
 [tool.uv.sources]
 kymobutler = { path = "../KymoButler", editable = true }
+synthkymo = { path = "../ingenia-kymograph", editable = true }
 
 [dependency-groups]
 dev = [
