@@ -19,10 +19,11 @@ This repository collects experiments across several evaluation branches:
 
 | Approach | Idea | Status |
 |----------|------|--------|
-| **Transformers over raw video** | Segmentation with SAM2 / SAM3 guided by detectors (blob_log, Grounding DINO) directly on the VSI stack | Prototypes (NB02, NB03) |
+| **Transformers over raw video** | Segmentation with SAM2 / SAM3 guided by detectors (blob_log, Grounding DINO) directly on the VSI stack | Prototypes (NB02, NB04) |
+| **SAM3 for axon ROI detection** | Temporal max-projection of synthetic video + SAM3 to automatically detect the axon ROI, compared against GT | Active (NB03) |
 | **Transformers over kymographs** | Same model family, but operating on the kymograph image instead of the video | Exploration |
-| **KymoButler baseline** | U-Net + classical tracker (Jakobs, Franze & Bhatt 2019, *eLife*) over kymographs | Baseline (NB05) |
-| **Synthetic kymographs** | Generation of kymographs with exact ground truth to validate trackers at progressive difficulty | Active (NB04) |
+| **KymoButler baseline** | U-Net + classical tracker (Jakobs, Franze & Bhatt 2019, *eLife*) over kymographs | Baseline (NB06) |
+| **Synthetic kymographs** | Generation of kymographs with exact ground truth to validate trackers at progressive difficulty | Active (NB05) |
 | **Classical preprocessing** | VSI/ETS reading, background subtraction, kymograph extraction | Support (NB01) |
 
 The central question running through the experiments: does transformer-based vision add value
@@ -36,9 +37,10 @@ of that information)?
 notebooks/   Experiments, one per approach/stage
   01_preprocesamiento.ipynb     Reading and preparing the videos
   02_sam2_prototipo.ipynb       SAM2 segmentation over video
-  03_sam3_prototipo.ipynb       SAM3 segmentation over video
-  04_kimografo.ipynb            Synthetic kymograph generation + GT
-  05_tracking_kymobutler.ipynb  KymoButler tracking and comparison vs GT
+  03_roi_sintetico_sam3.ipynb   SAM3 axon-ROI detection from synthetic video (GT comparison)
+  04_sam3_prototipo.ipynb       SAM3 segmentation over video
+  05_kimografo.ipynb            Synthetic kymograph generation + GT
+  06_tracking_kymobutler.ipynb  KymoButler tracking and comparison vs GT
 src/axonal_tracking/   Support modules reused by the notebooks
   ets_reader.py, preprocesamiento.py, kimografo.py,
   kimografo_sintetico.py, configuracion.py, visualizacion.py, ...

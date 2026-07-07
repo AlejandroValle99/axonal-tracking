@@ -1,0 +1,85 @@
+general:
+  duration_s: 30.0
+  fps: 2.0
+  pixel_scale_um: 0.07
+  bit_depth: 8
+  seed: 1973834859
+particles:
+  speed_um_s:
+    min: -1.0
+    max: 1.0
+  segment_duration_s:
+    min: 1.0
+    max: 8.0
+  pause_probability: 0.3
+  appear_disappear:
+    enabled: false
+    prob: 0.3
+  size_um:
+    min: 0.1
+    max: 0.25
+  brightness:
+    min: 0.13
+    max: 0.5
+  size_jitter: 0.0
+  brightness_jitter: 0.0
+  type_counts:
+    static: 4
+    anterograde: 2
+    retrograde: 0
+    pure_anterograde: 0
+    pure_retrograde: 0
+    bidirectional: 0
+preview:
+  kymograph_height: 2.5
+  position_time_height: 2.5
+  label_size: 8
+movie:
+  width_px: 480
+  height_px: 480
+  path:
+    n_control_points: 4
+  tube:
+    width_um: 0.5
+    brightness: 0.0
+    variation: 0.5
+  noise:
+    background: 0.05
+    read_sigma: 0.02
+    shot:
+      strength: 0.0
+    hot_pixels:
+      density: 0.0
+      dead_fraction: 0.3
+    illumination:
+      unevenness: 0.0
+    photobleaching:
+      end_fraction: 1.0
+  artifacts:
+    static_particles:
+      count: 5
+      size_um:
+        min: 0.2
+        max: 0.6
+      brightness:
+        min: 0.3
+        max: 0.8
+    tails:
+      count: 3
+      length_um:
+        min: 1.0
+        max: 3.0
+      brightness:
+        min: 0.2
+        max: 0.5
+    smoke:
+      count: 4
+      size_um:
+        min: 2.0
+        max: 5.0
+      brightness:
+        min: 0.05
+        max: 0.15
+  extraction:
+    strip_half_width_px: 3
+    aggregation: max
