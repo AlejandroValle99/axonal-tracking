@@ -6,6 +6,16 @@ dist/
 wheels/
 *.egg-info
 transcripts
+.vscode
+/datasets
+/diagrams
+
+
+# yolo
+/results
+/runs
+yolov8n.pt
+
 
 # Virtual environments
 .venv
