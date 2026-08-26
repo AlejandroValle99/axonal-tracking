@@ -10,6 +10,9 @@ Uso:
   uv run python scripts/exportar_etiquetas_deteccion.py train              # solo un split
   uv run python scripts/exportar_etiquetas_deteccion.py --movers-only      # solo clase movil,
                                                                             # escribe en yolo_detection_movers/
+  uv run python scripts/exportar_etiquetas_deteccion.py --min-desplazamiento-px 8
+                                                                            # umbral movil/estatico
+                                                                            # (default: 1.0, ver docs/handover.md SS2.3)
 """
 import sys
 from collections import Counter
@@ -26,15 +29,25 @@ SPLITS = ("train", "val", "test")
 def main() -> None:
     args = sys.argv[1:]
     movers_only = "--movers-only" in args
+    min_desplazamiento_px = 1.0
+    if "--min-desplazamiento-px" in args:
+        i = args.index("--min-desplazamiento-px")
+        min_desplazamiento_px = float(args[i + 1])
+        args = args[:i] + args[i + 2:]
     splits = [a for a in args if a != "--movers-only"] or list(SPLITS)
     out = DATASETS / ("yolo_detection_movers" if movers_only else "yolo_detection")
+    print(f"min_desplazamiento_px = {min_desplazamiento_px}")
 
     for sp in splits:
         src = DATASETS / sp
         if not src.is_dir():
             print(f"  {sp}: no existe {src}, salteado")
             continue
-        n = ed.exportar_dataset(src, out, sp, etiquetar_estaticos=not movers_only)
+        n = ed.exportar_dataset(
+            src, out, sp,
+            etiquetar_estaticos=not movers_only,
+            min_desplazamiento_px=min_desplazamiento_px,
+        )
         c = Counter()
         for t in (out / "labels" / sp).glob("*.txt"):
             for linea in t.read_text().splitlines():
