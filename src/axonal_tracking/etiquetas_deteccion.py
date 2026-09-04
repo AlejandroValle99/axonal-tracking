@@ -45,14 +45,17 @@ from skimage.morphology import disk
 
 __all__ = [
     "CajaTraza",
+    "InstanciaTraza",
     "ids_que_se_mueven",
     "cajas_desde_positions",
     "mascara_traza",
+    "instancias_desde_positions",
     "kymografo_a_rgb_uint8",
     "exportar_muestra",
     "exportar_dataset",
     "escribir_yaml_dataset",
     "plot_muestra_anotada",
+    "plot_instancias_anotadas",
 ]
 
 
@@ -70,6 +73,17 @@ CLASES = ("movil", "estatico")  # nombres para el data-config de YOLO
 # agranda este factor * size_px a cada lado en POSICION para encerrar el blob, no solo
 # el centro. (En TIEMPO no se agranda: cada frame es una fila, sin blur temporal.)
 FACTOR_ANCHO = 3.0
+
+# Umbral movil/estatico del laboratorio que aprendio el YOLO evaluado en notebook 09
+# (docs/handover.md SS2.3: 0.872um / 0.107um-por-px =~ 8.15px, redondeado a 8.0 -- mismo
+# valor que la constante local `MIN_DESPLAZAMIENTO_PX` de notebook 09). Las etiquetas de
+# deteccion (YOLO, `cajas_desde_positions`) usan 1.0 por default por otras razones
+# historicas (ver `scripts/exportar_etiquetas_deteccion.py`); las de instancia para
+# Mask2Former (`instancias_desde_positions`, notebook 10) SI necesitan coincidir con este
+# valor: si difieren, el subconjunto "ambiguo"/"movil" que se compara contra las filas
+# A_box/B_point/C_seq de notebook 09 mide una definicion distinta de "movil" y los
+# numeros dejan de ser comparables (plan/mask2former-guide.md SS2).
+MIN_DESPLAZAMIENTO_PX_MOVIL = 8.0
 
 
 # --------------------------------------------------------------------------- #
@@ -214,6 +228,69 @@ def mascara_traza(
     # usa ~3 sigma, FACTOR_ANCHO; la mascara queda algo mas ajustada, dentro de la caja).
     ancho_px = max(int(round(2.0 * float(sub["size_um"].mean()) / pixel_scale_um)), 1)
     return binary_dilation(mask, structure=disk(ancho_px))
+
+
+@dataclass
+class InstanciaTraza:
+    """Una mascara binaria (T, L) de una traza + su clase, para Mask2Former."""
+
+    particle_id: int
+    clase: int
+    mascara: np.ndarray  # (T, L) bool
+
+
+def instancias_desde_positions(
+    positions: pd.DataFrame,
+    pixel_scale_um: float,
+    shape: tuple[int, int],
+    *,
+    min_desplazamiento_px: float = MIN_DESPLAZAMIENTO_PX_MOVIL,
+    etiquetar_estaticos: bool = True,
+    tipos: list[str] | None = None,
+    solo_visibles: bool = True,
+) -> list[InstanciaTraza]:
+    """Una `InstanciaTraza` (mascara sin aplanar) por `particle_id`, para exportar
+    a `Mask2FormerForUniversalSegmentation` (`mask_labels`/`class_labels`).
+
+    **Por que no un `segmentation_map` de instancia unica por pixel** (el otro camino
+    que acepta `Mask2FormerImageProcessor.preprocess`): en un cruce dos trazas se
+    superponen en los mismos pixeles por construccion -- verificado sobre datos reales
+    del dataset (`sample_00016`, dos moviles, 131 px compartidos). Un mapa aplanado por
+    pixel asigna cada pixel a una sola instancia (last-writer-wins al rasterizar),
+    recortandole a la traza perdedora justo los pixeles del cruce -- exactamente la
+    senal de identidad que este modelo tiene que aprender a resolver (medido: de 1689 px
+    de una mascara, el round-trip por un `segmentation_map` aplanado deja 1558, un
+    recorte silencioso de 131 px en el cruce). Mask2Former no lo necesita aplanado: su
+    perdida es sigmoid+dice por query sobre `mask_labels` (no un softmax sobre un mapa de
+    etiquetas), asi que mascaras superpuestas son validas tal cual. Por eso esta funcion
+    devuelve una mascara POR instancia, sin fusionar -- construir `mask_labels`/
+    `class_labels` a partir de esta lista, sin pasar por `segmentation_maps`.
+
+    Mismos parametros/semantica que `cajas_desde_positions` (reusa `ids_que_se_mueven` y
+    `mascara_traza`, mismo criterio movil/estatico y mismos filtros), salvo:
+    `min_desplazamiento_px` default **8.0** en vez de 1.0 -- ver `MIN_DESPLAZAMIENTO_PX_MOVIL`.
+    """
+    moviles = ids_que_se_mueven(positions, pixel_scale_um, min_desplazamiento_px)
+    df = positions.copy()
+    if not etiquetar_estaticos:
+        df = df[df["particle_id"].isin(moviles)]
+    if tipos is not None:
+        df = df[df["type"].isin(tipos)]
+    if solo_visibles and "visible" in df.columns:
+        df = df[df["visible"].astype(bool)]
+
+    instancias: list[InstanciaTraza] = []
+    for pid, sub in df.groupby("particle_id"):
+        if len(sub) == 0:
+            continue
+        clase = CLASE_MOVIL if pid in moviles else CLASE_ESTATICO
+        mascara = mascara_traza(
+            positions, int(pid), pixel_scale_um, shape, solo_visibles=solo_visibles
+        )
+        if not mascara.any():  # particula fuera del kymografo tras filtros (ver cajas_desde_positions)
+            continue
+        instancias.append(InstanciaTraza(int(pid), clase, mascara))
+    return instancias
 
 
 # --------------------------------------------------------------------------- #
@@ -386,4 +463,55 @@ def plot_muestra_anotada(
                 fontsize=7, va="bottom")
     ax.set_xlabel("posición / columna (px)")
     ax.set_ylabel("frame / fila (tiempo)")
+    return ax
+
+
+def plot_instancias_anotadas(
+    kymo: np.ndarray,
+    positions: pd.DataFrame,
+    pixel_scale_um: float,
+    ax=None,
+    *,
+    min_desplazamiento_px: float = MIN_DESPLAZAMIENTO_PX_MOVIL,
+    etiquetar_estaticos: bool = True,
+    tipos: list[str] | None = None,
+    solo_visibles: bool = True,
+):
+    """Dibuja cada `InstanciaTraza` de `instancias_desde_positions` con un color
+    DISTINTO por instancia (no por clase, a diferencia de `plot_muestra_anotada`) --
+    la trampa que este chequeo tiene que detectar es especifica de Mask2Former:
+    que las mascaras exportadas sigan superpuestas donde corresponde (cruces) en vez
+    de haberse recortado por un aplanado accidental (ver docstring de
+    `instancias_desde_positions`). Superponer todas las mascaras con alpha bajo hace
+    visible la zona de solape como una mezcla de colores. Devuelve el `ax`."""
+    import matplotlib.pyplot as plt
+
+    kymo2d = np.asarray(kymo)
+    if kymo2d.ndim == 3:
+        kymo2d = kymo2d[..., 0]
+    T, L = kymo2d.shape
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 5))
+    ax.imshow(kymo2d, cmap="gray", aspect="auto",
+              vmin=np.percentile(kymo2d, 1), vmax=np.percentile(kymo2d, 99.5))
+
+    instancias = instancias_desde_positions(
+        positions, pixel_scale_um, (T, L),
+        min_desplazamiento_px=min_desplazamiento_px, etiquetar_estaticos=etiquetar_estaticos,
+        tipos=tipos, solo_visibles=solo_visibles,
+    )
+    cmap = plt.get_cmap("tab20")
+    for k, inst in enumerate(instancias):
+        color = cmap(k % 20)
+        m = inst.mascara
+        overlay = np.zeros((*m.shape, 4))
+        overlay[m] = (*color[:3], 0.45)
+        ax.imshow(overlay, aspect="auto")
+        ys, xs = np.where(m)
+        if len(xs):
+            ax.text(xs.min(), ys.min() - 0.5, f"{inst.particle_id}:{CLASES[inst.clase]}",
+                    color=color, fontsize=6, va="bottom")
+    ax.set_xlabel("posición / columna (px)")
+    ax.set_ylabel("frame / fila (tiempo)")
+    ax.set_title(f"{len(instancias)} instancias")
     return ax
