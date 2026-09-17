@@ -92,6 +92,30 @@ def polilineas_kymobutler(escena: dict, models) -> tuple[list[pd.DataFrame], flo
     return polis, scale_factor
 
 
+def rasterizar(poli: pd.DataFrame, shape: tuple[int, int]) -> np.ndarray:
+    """Polilinea -> mascara fina (T, L), un pixel por fila."""
+    T, L = shape
+    m = np.zeros((T, L), dtype=bool)
+    fr = poli["frame"].to_numpy().astype(int)
+    co = np.round(poli["col_subpixel"].to_numpy()).astype(int)
+    ok = (fr >= 0) & (fr < T) & (co >= 0) & (co < L)
+    m[fr[ok], co[ok]] = True
+    return m
+
+
+def via_subpixel(poli: pd.DataFrame, kymo: np.ndarray) -> pd.DataFrame:
+    """Re-extrae la polilinea por la MISMA ruta que Mask2Former y que las filas 2/3/3b del
+    plan de NB11: rasterizar a mascara fina -> `ev.extraer_subpixel`.
+
+    Motivo: KymoButler emite coordenadas enteras de esqueleto y NUNCA pasa por
+    `extraer_subpixel`, mientras los pipelines basados en mascara si. Eso les da pisos de
+    `frac_id_switch` muy distintos (0.005 vs 0.132, ver `docs/revision-rumbo-vit.md`), asi
+    que comparar los numeros crudos entre rutas es invalido. Esta variante pone a
+    KymoButler en la ruta ajena para tener una comparacion sin aritmetica de excesos.
+    """
+    return ev.extraer_subpixel(rasterizar(poli, kymo.shape), kymo)
+
+
 def es_movil(poli: pd.DataFrame) -> bool:
     """Analogo, del lado de la PREDICCION, del filtro de clase `movil` que se le aplica a
     Mask2Former: KymoButler no emite clase, asi que se usa el mismo criterio de
@@ -126,12 +150,24 @@ def main() -> None:
     print(f"scale_factor: min={sfs.min():.3f} mediana={np.median(sfs):.3f} max={sfs.max():.3f}")
 
     resultados = {}
-    for etiqueta, filtrar in (("todas", False), ("solo_moviles", True)):
-        esc_ev = {
-            n: {**e, "polilineas": [p for p in e["polilineas"] if not filtrar or es_movil(p)]}
-            for n, e in escenas.items()
-        }
+    variantes = (
+        ("todas", False, False),
+        ("solo_moviles", True, False),
+        # misma ruta de extraccion que Mask2Former / filas 2-3b del plan de NB11
+        ("solo_moviles_subpixel", True, True),
+    )
+    for etiqueta, filtrar, subpix in variantes:
+        esc_ev = {}
+        for n, e in escenas.items():
+            polis = [p for p in e["polilineas"] if not filtrar or es_movil(p)]
+            if subpix:
+                polis = [q for q in (via_subpixel(p, e["kymo"]) for p in polis) if len(q)]
+            esc_ev[n] = {**e, "polilineas": polis}
         tr, res = ev.evaluar_trayectorias_polilineas(esc_ev, min_desplazamiento_px=MIN_DESP)
+        mm = tr[tr.gt_id != -1]
+        frag = mm.groupby(["muestra", "gt_id"]).size()
+        res = {**res, "fragmentos_por_gt": round(float(frag.mean()), 3),
+               "frac_gt_fragmentado": round(float((frag > 1).mean()), 3)}
         resultados[etiqueta] = res
         tr.to_csv(SALIDA / f"trayectorias_400_{etiqueta}.csv", index=False)
         print(f"\n=== KymoButler, 400 muestras, predicciones: {etiqueta} ===")

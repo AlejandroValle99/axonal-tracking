@@ -198,10 +198,18 @@ def mascara_traza(
     shape: tuple[int, int],
     *,
     solo_visibles: bool = True,
+    dilatar: bool = True,
 ) -> np.ndarray:
     """Mascara binaria (T, L) de una traza: polilinea rasterizada y dilatada por
     su ancho renderizado real (`size_um / pixel_scale_um`). Mismo criterio que el
-    prototipo de `07_validacion_prompts_sam3.ipynb` (paso 3.2 de la guia)."""
+    prototipo de `07_validacion_prompts_sam3.ipynb` (paso 3.2 de la guia).
+
+    `dilatar=False` (usado por `asociacion.trackness_gt_moviles`, SS3.3 Gate A):
+    devuelve la polilinea 1-px sin dilatar. Con `dilatar=True` (default, todo el
+    resto de los llamadores) dos trazas GT que se cruzan a angulo bajo se funden en
+    un solo blob ancho que `process_segmentation_bi` (`thin()`) puede colapsar a UNA
+    linea central -- borrando la juncion en vez de representarla. Sin dilatar, cada
+    traza se queda en su propia columna de 1px y la juncion sobrevive."""
     T, L = shape
     sub = positions[positions["particle_id"] == particle_id]
     if solo_visibles and "visible" in sub.columns:
@@ -223,6 +231,8 @@ def mascara_traza(
         r, c = int(rows[0]), int(round(cols[0]))
         if 0 <= r < T and 0 <= c < L:
             mask[r, c] = True
+    if not dilatar:
+        return mask
 
     # dilatar por ~2 sigma para cubrir el nucleo brillante del blob gaussiano (la caja
     # usa ~3 sigma, FACTOR_ANCHO; la mascara queda algo mas ajustada, dentro de la caja).

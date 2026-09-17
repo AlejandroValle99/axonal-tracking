@@ -41,6 +41,10 @@ notebooks/   Experiments, one per approach/stage
   04_sam3_prototipo.ipynb       SAM3 segmentation over video
   05_kimografo.ipynb            Synthetic kymograph generation + GT
   06_tracking_kymobutler.ipynb  KymoButler tracking and comparison vs GT
+  07_validacion_prompts_sam3.ipynb  SAM3 box- vs point-prompt validation (pre-build check)
+  08_deteccion_yolo.ipynb       YOLO track detection (Stage 1) — frozen, negative-result baseline
+  09_segmentacion_transformer.ipynb  SAM3 per-track masks from YOLO boxes (Stage 2) — frozen,
+                                negative-result baseline (see plan/notebooks-08-09-closeout.md)
 src/axonal_tracking/   Support modules reused by the notebooks
   ets_reader.py, preprocesamiento.py, kimografo.py,
   kimografo_sintetico.py, configuracion.py, visualizacion.py, ...
