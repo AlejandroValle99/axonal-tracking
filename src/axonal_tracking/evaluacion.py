@@ -45,6 +45,7 @@ __all__ = [
     "iou_mascara",
     "nearest_particle_per_row",
     "resumen_identidad",
+    "velocidad_px_frame",
 ]
 
 # Mismos umbrales que notebook 09 (SS6, SS6.1, SS7, SS6.3) -- no cambiar sin repetir la
@@ -137,11 +138,20 @@ def extraer_subpixel(mask: np.ndarray, kymo: np.ndarray, margen_px: int = 2) -> 
     return pd.DataFrame(filas, columns=["frame", "col_subpixel"])
 
 
-def _velocidad_px_frame(frames, cols) -> float:
-    """Pendiente (px/frame) por ajuste lineal -- necesita >= 2 puntos. Verbatim de NB09 SS6.3."""
+def velocidad_px_frame(frames, cols) -> float:
+    """Pendiente (px/frame) por ajuste lineal -- necesita >= 2 puntos. Verbatim de NB09 SS6.3.
+
+    Publica (promovida desde `_velocidad_px_frame`, plan de asociacion SS9 item 9):
+    es el mismo ajuste de pendiente que todo velocidad publicada en este repo ya usa,
+    y `asociacion.py` (SS4.2 `dv`, SS5.2 `slope`) lo necesita como funcion publica en
+    vez de copiar una segunda implementacion -- eso rompería comparabilidad con estos
+    mismos numeros, igual que un segundo centroide."""
     if len(frames) < 2:
         return np.nan
     return float(np.polyfit(np.asarray(frames, dtype=float), np.asarray(cols, dtype=float), 1)[0])
+
+
+_velocidad_px_frame = velocidad_px_frame  # alias privado, por compatibilidad con NB09/callers existentes
 
 
 # --------------------------------------------------------------------------- #

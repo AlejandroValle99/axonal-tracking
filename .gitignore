@@ -5,10 +5,12 @@ build/
 dist/
 wheels/
 *.egg-info
+.ruff_cache/
 transcripts
 .vscode
 /datasets
 /diagrams
+.DS_Store
 
 
 # yolo
