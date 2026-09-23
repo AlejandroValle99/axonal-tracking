@@ -49,6 +49,8 @@ __all__ = [
     "asignar_gt",
     "caracteristicas_segmentos",
     "costo_asociacion",
+    "decodificar_bipartito",
+    "decodificar_greedy",
     "detectar_junciones",
     "enlaces_verdaderos",
     "enlazar_oracle",
@@ -428,6 +430,8 @@ class CaracteristicasSegmento:
     pendiente_entrada: float  # px/frame, ajuste local sobre las PRIMERAS ~10 filas (SS4.2, termino dv)
     intensidad_media: float
     intensidad_std: float
+    curvatura: float  # residual RMS (px) del ajuste lineal completo (SS5.2, token de Stage 2)
+    n_filas: int  # frames UNICOS del segmento (SS5.2, token de Stage 2 -- no cuenta pixeles duplicados)
 
 
 _VENTANA_PENDIENTE_LOCAL = 10  # filas, ver docstring de _pendiente_ventana
@@ -464,6 +468,22 @@ def _intensidad_segmento(segmento: Segmento, kymo: np.ndarray) -> tuple[float, f
     return float(valores.mean()), float(valores.std())
 
 
+def _curvatura_segmento(segmento: Segmento) -> float:
+    """Residual RMS (px) del ajuste lineal (t,x) sobre TODO el segmento -- distingue
+    una corrida (residual ~0, recta) de una pausa+corrida (residual grande, quiebre),
+    SS5.2. Frames unicos (`_x_medio_por_t`), no puntos crudos, misma unidad que
+    `pendiente`. Con <3 frames unicos el ajuste no es informativo (una recta pasa
+    exacto por 2 puntos) -- se devuelve 0.0."""
+    x_por_t = _x_medio_por_t(segmento)
+    ts = np.array(sorted(x_por_t))
+    if len(ts) < 3:
+        return 0.0
+    xs = np.array([x_por_t[t] for t in ts])
+    pendiente, intercepto = np.polyfit(ts, xs, 1)
+    residuales = xs - (pendiente * ts + intercepto)
+    return float(np.sqrt(np.mean(residuales ** 2)))
+
+
 def caracteristicas_segmentos(
     segmentos: list[Segmento], kymo: np.ndarray
 ) -> list[CaracteristicasSegmento]:
@@ -474,7 +494,11 @@ def caracteristicas_segmentos(
         p_salida = _pendiente_ventana(seg, "fin")
         p_entrada = _pendiente_ventana(seg, "ini")
         i_media, i_std = _intensidad_segmento(seg, kymo)
-        salida.append(CaracteristicasSegmento(pendiente, p_salida, p_entrada, i_media, i_std))
+        curvatura = _curvatura_segmento(seg)
+        n_filas = len(_x_medio_por_t(seg))
+        salida.append(CaracteristicasSegmento(
+            pendiente, p_salida, p_entrada, i_media, i_std, curvatura, n_filas
+        ))
     return salida
 
 
@@ -606,6 +630,82 @@ def _seguir_cadenas(n: int, sucesor: dict[int, int]) -> list[list[int]]:
     return cadenas
 
 
+def decodificar_bipartito(
+    n: int, pares: list[tuple[int, int]], costos: dict[tuple[int, int], float], umbral: float
+) -> list[list[int]]:
+    """Nucleo de decodificacion, agnostico al origen del costo (SS4.3/SS5.5 --
+    Stage 2 sustituye `-log P(link)` por `costo_asociacion` y llama a ESTA misma
+    funcion, para que la comparacion aisle la funcion de scoring y nada mas).
+    Matching bipartito GLOBAL (predecesor -> sucesor), a lo sumo un predecesor y un
+    sucesor por segmento: matriz de costo N x N SOLO sobre los pares admisibles
+    (`costo <= umbral`; todo lo demas, costo centinela), `linear_sum_assignment`
+    resuelve la asignacion completa, y el post-filtro queda como guarda de no-op.
+
+    **El umbral se aplica ANTES de armar la matriz, no despues -- bug real
+    encontrado por revision externa (`plan/notebook-11-review.md` SS1.2) en la
+    version anterior de esta funcion.** Meter TODOS los costos (admisibles o no) en
+    la matriz y filtrar recien al final parece inofensivo pero no lo es:
+    `linear_sum_assignment` minimiza la suma de TODA la asignacion (n filas, n
+    columnas, completa por construccion), y cualquier costo real -- por mas que
+    supere `umbral` -- es astronomicamente mas barato que la centinela (1e6). El
+    solver entonces SIEMPRE prefiere darle a una fila un par inadmisible (costo,
+    digamos, 20) antes que dejarla con la centinela, incluso si eso le "roba" a
+    otra fila su mejor candidato admisible (costo 2) para que esa otra fila tambien
+    consiga un par real en vez de la centinela. El resultado: la optimizacion real
+    que resolvia la version anterior era "maximizar cuantas filas consiguen CUALQUIER
+    par real", no "minimizar costo entre los pares admisibles" -- un problema
+    distinto. Con el umbral aplicado ANTES, los pares inadmisibles ya son centinela
+    y no pueden robarle nada a nadie.
+
+    Ver `decodificar_greedy` para la alternativa local que SS4.3 tambien permite --
+    sigue siendo valida (nunca tuvo este problema: nunca considero un par por
+    encima del umbral). Cada costo admisible debe ser finito y bien por debajo de
+    la centinela (1e6) -- un costo sin acotar (p.ej. `-log` de una probabilidad sin
+    piso) puede desbordarla y corromper la asignacion en silencio."""
+    CENTINELA = 1e6
+    matriz = np.full((n, n), CENTINELA)
+    for (i, j), c in costos.items():
+        assert c < CENTINELA, f"costo {c} para par ({i},{j}) alcanza/supera la centinela {CENTINELA}"
+        if c <= umbral:
+            matriz[i, j] = c
+    filas, cols = linear_sum_assignment(matriz)
+    sucesor = {int(i): int(j) for i, j in zip(filas, cols) if matriz[i, j] <= umbral}
+    return _seguir_cadenas(n, sucesor)
+
+
+def decodificar_greedy(
+    n: int, costos: dict[tuple[int, int], float], umbral: float
+) -> list[list[int]]:
+    """Alternativa greedy a `decodificar_bipartito` (SS4.3, ambas permitidas):
+    ordena TODOS los pares candidatos por costo ascendente y acepta el primero que
+    deje libres tanto el sucesor de `i` como el predecesor de `j`, sin buscar un
+    optimo global. Evita por construccion el riesgo de que el matching bipartito
+    global le "robe" a un segmento su unico buen candidato para mejorar la suma
+    total en otro lado -- irrelevante para una estructura de cadenas
+    casi-disjuntas como esta, y mas facil de auditar."""
+    pares_ordenados = sorted((c, i, j) for (i, j), c in costos.items() if c <= umbral)
+    sucesor: dict[int, int] = {}
+    tiene_predecesor: set[int] = set()
+    for _c, i, j in pares_ordenados:
+        if i in sucesor or j in tiene_predecesor:
+            continue
+        sucesor[i] = j
+        tiene_predecesor.add(j)
+    return _seguir_cadenas(n, sucesor)
+
+
+def _costos_clasicos(
+    segmentos: list[Segmento],
+    caracteristicas: list[CaracteristicasSegmento],
+    pares: list[tuple[int, int]],
+    pesos: dict[str, float],
+) -> dict[tuple[int, int], float]:
+    return {
+        (i, j): costo_asociacion(segmentos[i], caracteristicas[i], segmentos[j], caracteristicas[j], pesos)
+        for i, j in pares
+    }
+
+
 def enlazar_por_costo(
     segmentos: list[Segmento],
     caracteristicas: list[CaracteristicasSegmento],
@@ -614,26 +714,9 @@ def enlazar_por_costo(
     *,
     umbral: float,
 ) -> list[list[int]]:
-    """Decodifica enlaces como matching bipartito GLOBAL (predecesor -> sucesor), a
-    lo sumo un predecesor y un sucesor por segmento (SS4.3): matriz de costo N x N
-    sobre `pares` (todo lo demas, costo centinela muy alto), `linear_sum_assignment`
-    resuelve la asignacion completa, y se descartan los enlaces cuyo costo real
-    supera `umbral` (evita forzar un enlace cuando ningun candidato es bueno --
-    `linear_sum_assignment` por si solo siempre empareja TODO, aun con pares
-    centinela). Ver `enlazar_por_costo_greedy` para la alternativa local que SS4.3
-    tambien permite -- el optimo global puede, en principio, sacrificar el mejor
-    candidato de un segmento para mejorar la suma total en otro lado; verificar
-    contra la variante greedy antes de asumir que no pasa."""
-    n = len(segmentos)
-    CENTINELA = 1e6
-    costos = np.full((n, n), CENTINELA)
-    for i, j in pares:
-        costos[i, j] = costo_asociacion(
-            segmentos[i], caracteristicas[i], segmentos[j], caracteristicas[j], pesos
-        )
-    filas, cols = linear_sum_assignment(costos)
-    sucesor = {int(i): int(j) for i, j in zip(filas, cols) if costos[i, j] <= umbral}
-    return _seguir_cadenas(n, sucesor)
+    """Costo clasico (SS4.2) + `decodificar_bipartito` (SS4.3)."""
+    costos = _costos_clasicos(segmentos, caracteristicas, pares, pesos)
+    return decodificar_bipartito(len(segmentos), pares, costos, umbral)
 
 
 def enlazar_por_costo_greedy(
@@ -644,28 +727,9 @@ def enlazar_por_costo_greedy(
     *,
     umbral: float,
 ) -> list[list[int]]:
-    """Alternativa greedy a `enlazar_por_costo` (SS4.3, ambas permitidas): ordena
-    TODOS los pares candidatos por costo ascendente y acepta el primero que deje
-    libres tanto el sucesor de `i` como el predecesor de `j`, sin buscar un optimo
-    global. Evita por construccion el riesgo de que el matching bipartito global le
-    "robe" a un segmento su unico buen candidato para mejorar la suma total en otro
-    lado -- irrelevante para una estructura de cadenas casi-disjuntas como esta, y
-    mas facil de auditar."""
-    costos_pares = []
-    for i, j in pares:
-        c = costo_asociacion(segmentos[i], caracteristicas[i], segmentos[j], caracteristicas[j], pesos)
-        if c <= umbral:
-            costos_pares.append((c, i, j))
-    costos_pares.sort(key=lambda t: t[0])
-
-    sucesor: dict[int, int] = {}
-    tiene_predecesor: set[int] = set()
-    for _c, i, j in costos_pares:
-        if i in sucesor or j in tiene_predecesor:
-            continue
-        sucesor[i] = j
-        tiene_predecesor.add(j)
-    return _seguir_cadenas(len(segmentos), sucesor)
+    """Costo clasico (SS4.2) + `decodificar_greedy` (SS4.3)."""
+    costos = _costos_clasicos(segmentos, caracteristicas, pares, pesos)
+    return decodificar_greedy(len(segmentos), costos, umbral)
 
 
 def polilineas_desde_cadenas(

@@ -13,16 +13,20 @@ GT, que solo sirven para validar el extractor. Pasos:
    (si no, `d_pos` domina por escala -- 0-80px contra `1-cos_theta` en 0-2 -- y el
    optimizador no puede reponderar nada; ver justificacion en el docstring de
    `ajustar_pesos`). Nunca se toca test en este paso.
-3. Barrido de umbral x decodificador (Hungarian vs greedy, SS4.3) sobre una
-   submuestra de 100 escenas de TRAIN -- el ajuste de pesos optimiza F1 por PAR, que
-   no es lo mismo que buen F1/fragmentacion a nivel TRAYECTORIA; este barrido elige
-   el punto de operacion honesto (sigue siendo train, nunca test).
+3. Barrido de umbral x decodificador (Hungarian vs greedy, SS4.3) sobre las 400
+   muestras de VAL completas (antes: 100 de train en orden `sorted()[:100]` -- el
+   mismo patron `sorted(test)[:40]` que `docs/revision-rumbo-vit.md` SS1 documenta
+   como error para NB10; esas 100 resultaron un subconjunto facil, ver
+   `plan/notebook-11-review.md` SS1.3) -- el ajuste de pesos optimiza F1 por PAR,
+   que no es lo mismo que buen F1/fragmentacion a nivel TRAYECTORIA; este barrido
+   elige el punto de operacion honesto (val, nunca test), con la regla de Gate B
+   (SS8) aplicada igual a las filas 2/3/3b (`elegir_punto_operacion`).
 4. Fila 2 del ablation matrix (SS6): decodificar + evaluar con el punto elegido
    sobre las 400 muestras de **test**, mismo harness que Gate A. Test se toca UNA
    sola vez, aca.
 
-Requiere `results/asociacion/cache/{train,test}/` tibios (`scripts/evaluar_gate_a.py`
-y `scripts/preparar_cache_kymobutler.py train`).
+Requiere `results/asociacion/cache/{train,val,test}/` tibios (`scripts/evaluar_gate_a.py`
+y `scripts/preparar_cache_kymobutler.py {train,val}`).
 
 Salida: `results/asociacion/costo_clasico_resumen.json`,
 `results/asociacion/costo_clasico_fila2.csv`.
@@ -61,14 +65,19 @@ MIN_FILAS_SEGMENTO = 5
 # de aflojar a ciegas.
 MAX_GAP_FRAMES = 30.0
 MAX_SALTO_PX = 40.0
-N_MUESTRAS_BARRIDO = 100  # submuestra de train para elegir umbral/decodificador (paso 3)
 
 
 def preparar_muestra(nombre: str, split: str):
     """De una muestra cacheada a (segmentos, caracteristicas, pares, verdaderos,
-    escena) -- el mismo pipeline de segmentacion que Gate A (fuente `kymobutler`),
-    reusado tal cual para que la comparacion entre oraculo y costo clasico sea
-    sobre el MISMO conjunto de segmentos."""
+    asignaciones, escena, preprocessed, skel) -- el mismo pipeline de segmentacion
+    que Gate A (fuente `kymobutler`), reusado tal cual para que la comparacion
+    entre oraculo, costo clasico y atencion (v1/v2) sea sobre el MISMO conjunto de
+    segmentos. `preprocessed`/`skel` se devuelven ademas de `segmentos` porque
+    Stage 2b (v2, SS5.6) los necesita para extraer los tiles de DecNet -- no
+    recomputar el esqueleto una segunda vez en el script de v2. `asignaciones` se
+    devuelve para que Stage 2 (v1/v2) pueda excluir del entrenamiento los pares que
+    tocan un segmento sin asignar (`particle_id == -1`) -- SS5.4 pide excluirlos de
+    la perdida, no tratarlos como negativos (`plan/notebook-11-review.md` SS2.4)."""
     d = RAIZ / "datasets" / split / nombre
     e = cargar_escena(d)
     L = e["kymo"].shape[1]
@@ -84,7 +93,7 @@ def preparar_muestra(nombre: str, split: str):
     caract = aso.caracteristicas_segmentos(segmentos, e["kymo"])
     pares = aso.pares_candidatos(segmentos, max_gap_frames=MAX_GAP_FRAMES, max_salto_px=MAX_SALTO_PX)
     verdaderos = aso.enlaces_verdaderos(segmentos, asignaciones)
-    return segmentos, caract, pares, verdaderos, e
+    return segmentos, caract, pares, verdaderos, asignaciones, e, pre, skel
 
 
 def features_par(segmentos, caract, i: int, j: int) -> np.ndarray:
@@ -171,7 +180,7 @@ def preparar_split(nombres: list[str], split: str, *, con_gt: bool):
     fallos = []
     for nombre in nombres:
         try:
-            segmentos, caract, pares, verdaderos, e = preparar_muestra(nombre, split)
+            segmentos, caract, pares, verdaderos, _asig, e, _pre, _skel = preparar_muestra(nombre, split)
         except Exception as exc:  # noqa: BLE001 -- una muestra rota no debe tumbar el split
             fallos.append({"muestra": nombre, "error": repr(exc)})
             continue
@@ -189,6 +198,57 @@ def preparar_split(nombres: list[str], split: str, *, con_gt: bool):
         resultado["n_verdaderos_totales"] = n_verdaderos_totales
         resultado["n_verdaderos_sobreviven"] = n_verdaderos_sobreviven
     return resultado
+
+
+FRAG_MAX_GATE_B = 1.282  # fragmentos/GT de DecNet (results/kymobutler/resumen_400.json, solo_moviles_subpixel)
+F1_MIN_GATE_B = 0.968  # track_f1 de DecNet -- las dos barras de Gate B (plan SS8)
+
+
+def elegir_punto_operacion(
+    filas_barrido: list[dict], *, frag_max: float = FRAG_MAX_GATE_B, f1_min: float = F1_MIN_GATE_B,
+) -> dict:
+    """Elige el punto de operacion del barrido umbral x decodificador (SS4.3/SS5.5)
+    con la REGLA UNICA de Gate B (plan SS8), la misma para las filas 2/3/3b: entre
+    las filas con `fragmentos_por_gt <= frag_max` (el de DecNet, 1.282) Y
+    `track_f1 >= f1_min` (el de DecNet, 0.968), la de MENOR `frac_id_switch` -- la
+    metrica primaria del plan (SS7 item 1).
+
+    **Historia -- dos versiones anteriores de esta funcion, ambas descartadas**
+    (`plan/notebook-11-review.md` SS1.3): la primera elegia por `track_f1` maximo
+    entre `fragmentos_por_gt <= 1.5` (una barra inventada en este script, no del
+    plan) con una barra de respaldo mas floja si no habia candidatos -- eso hacia
+    que las filas se seleccionaran con reglas DISTINTAS (fila 2 desde una barra,
+    fila 3 desde la de respaldo referenciando el fragmentos_por_gt de TEST de la
+    fila 2 -- una fuga de test hacia la seleccion de otra fila). La segunda elegia
+    por menor `frac_id_switch` directamente, que resulto en el artefacto que SS7
+    item 3 nombra: `frac_id_switch` 0.073 -> 0.008 en la fila 2 a costa de
+    `fragmentos_por_gt` 1.604 -> 2.657 (fragmentar mas abarata el switch-rate
+    "gratis"). La solucion no es una barra floja NI optimizar `frac_id_switch` sin
+    mirar fragmentacion: es la barra EXACTA que el plan ya define (Gate B), fija e
+    igual para las tres filas -- no hay eleccion de parametro que hacer.
+
+    Si NINGUNA fila cumple las dos barras a la vez, esta funcion NO elige a ciegas:
+    devuelve el punto de MENOR `fragmentos_por_gt` (desempate por mejor `track_f1`)
+    con `cumple_barras_seleccion_val=False` explicito, para que el caller reporte la
+    falla en vez de esconderla detras de un numero que parece un exito.
+
+    **`cumple_barras_seleccion_val` NO es el veredicto de Gate B.** Es solo si estas
+    dos barras (fragmentacion, F1) tienen algun candidato en el barrido de VAL. El
+    veredicto real de Gate B (plan SS8) exige ademas `frac_id_switch` materialmente
+    por debajo del 0.103 de DecNet, medido una sola vez en TEST -- eso se calcula en
+    el notebook (11_asociacion_atencion.ipynb SS7), no aca. Una fila puede tener
+    `cumple_barras_seleccion_val=True` y aun asi fallar Gate B (le paso a la fila 2:
+    cumple las barras en val pero su `frac_id_switch` de test, 0.136, queda por
+    ENCIMA del 0.103 de DecNet, no por debajo)."""
+    candidatos = [f for f in filas_barrido if f["fragmentos_por_gt"] is not None
+                  and f["fragmentos_por_gt"] <= frag_max and f["track_f1"] >= f1_min]
+    if candidatos:
+        elegido = dict(min(candidatos, key=lambda f: f["frac_id_switch"]))
+        elegido["cumple_barras_seleccion_val"] = True
+        return elegido
+    cercano = dict(min(filas_barrido, key=lambda f: (f["fragmentos_por_gt"] or float("inf"), -f["track_f1"])))
+    cercano["cumple_barras_seleccion_val"] = False
+    return cercano
 
 
 def evaluar_decodificado(datos: dict, decodificador, pesos, umbral) -> dict:
@@ -238,10 +298,9 @@ def main() -> None:
     print(f"  umbral (espacio normalizado)={umbral_base:.4f}  F1 por-par={diag_ajuste['f1_por_par']:.4f}  "
           f"precision={diag_ajuste['precision']:.4f}  recall={diag_ajuste['recall']:.4f}", flush=True)
 
-    print(f"\n=== Barrido umbral x decodificador sobre {N_MUESTRAS_BARRIDO} muestras de train ===",
-          flush=True)
-    nombres_barrido = nombres_train[:N_MUESTRAS_BARRIDO]
-    prep_barrido = preparar_split(nombres_barrido, "train", con_gt=False)
+    print("\n=== Barrido umbral x decodificador sobre val (400 muestras) ===", flush=True)
+    nombres_val = [d.name for d in sorted((RAIZ / "datasets" / "val").glob("sample_*"))]
+    prep_val = preparar_split(nombres_val, "val", con_gt=False)
     factores = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
     filas_barrido = []
     for decod_nombre, decodificador in (
@@ -249,21 +308,21 @@ def main() -> None:
     ):
         for factor in factores:
             umbral = umbral_base * factor
-            _, res = evaluar_decodificado(prep_barrido["datos"], decodificador, pesos, umbral)
+            _, res = evaluar_decodificado(prep_val["datos"], decodificador, pesos, umbral)
             filas_barrido.append({"decodificador": decod_nombre, "factor_umbral": factor,
                                     "umbral": umbral, **res})
             print(f"  [{decod_nombre}] factor={factor:>4}  track_f1={res['track_f1']}  "
                   f"frac_id_switch={res['frac_id_switch']}  fragmentos_por_gt={res['fragmentos_por_gt']}  "
                   f"precision={res['track_precision']}  recall={res['track_recall']}", flush=True)
 
-    # Punto de operacion: entre los que no sobre-fragmentan (fragmentos_por_gt <= 1.5,
-    # semejante al 1.28 de KymoButler/1.00 del oraculo), el de mejor track_f1 -- elegido
-    # en TRAIN, nunca en test (SS4.1/§4.2).
-    candidatos = [f for f in filas_barrido if (f["fragmentos_por_gt"] or 99) <= 1.5]
-    elegido = max(candidatos or filas_barrido, key=lambda f: f["track_f1"])
+    # Elegido en VAL con la regla de seleccion de SS8, nunca en test -- ver elegir_punto_operacion.
+    # cumple_barras_seleccion_val != veredicto de Gate B (ese se calcula en el notebook SS7,
+    # con el frac_id_switch de TEST contra el 0.103 de DecNet -- ver docstring de la funcion).
+    elegido = elegir_punto_operacion(filas_barrido)
     print(f"\n  elegido: decodificador={elegido['decodificador']}  factor={elegido['factor_umbral']}  "
-          f"umbral={elegido['umbral']:.4f}  (train, {N_MUESTRAS_BARRIDO} muestras: "
-          f"track_f1={elegido['track_f1']}  fragmentos_por_gt={elegido['fragmentos_por_gt']})", flush=True)
+          f"umbral={elegido['umbral']:.4f}  cumple_barras_seleccion_val={elegido['cumple_barras_seleccion_val']}  "
+          f"(val: track_f1={elegido['track_f1']}  frac_id_switch={elegido['frac_id_switch']}  "
+          f"fragmentos_por_gt={elegido['fragmentos_por_gt']})", flush=True)
 
     decodificador_elegido = (
         aso.enlazar_por_costo if elegido["decodificador"] == "hungarian" else aso.enlazar_por_costo_greedy
@@ -290,7 +349,7 @@ def main() -> None:
             "frac_perdida": frac_perdida_poda,
         },
         "ajuste_train": {**diag_ajuste, "umbral_base_normalizado": umbral_base},
-        "barrido_umbral_train": filas_barrido,
+        "barrido_umbral_val": filas_barrido,
         "punto_elegido": elegido,
         "fila_2_test": res,
         "fallos_train": prep_train["fallos"],
