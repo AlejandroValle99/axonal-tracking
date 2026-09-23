@@ -41,6 +41,7 @@ __all__ = [
     "evaluar_trayectorias_polilineas",
     "extraer_subpixel",
     "flaggear_cruces",
+    "flaggear_cruces_gt",
     "iou_caja",
     "iou_mascara",
     "nearest_particle_per_row",
@@ -247,6 +248,40 @@ def flaggear_cruces(
                 "iou_mascaras_crudas": round(float(iou), 3),
             })
     return filas
+
+
+def flaggear_cruces_gt(
+    positions: pd.DataFrame,
+    pixel_scale_um: float,
+    shape: tuple[int, int],
+    min_desplazamiento_px: float,
+    *,
+    solape_px: int = 20,
+) -> set[int]:
+    """Flag de ambiguedad del lado del GT (plan de asociacion SS2). A diferencia de
+    `flaggear_cruces` (pares de mascaras PREDICHAS -- roto para modelos por-query
+    como Mask2Former, cuyas instancias son disjuntas por construccion y nunca se
+    solapan entre si: `docs/revision-rumbo-vit.md` SS1), esta version marca
+    directamente sobre el ground truth y no depende de que prediccion se este
+    evaluando: el conjunto de `particle_id` de moviles cuya `ed.mascara_traza` se
+    solapa con la de OTRO movil en >= `solape_px` pixeles.
+
+    **Ancho de mascara**: `ed.mascara_traza` dilata por defecto (`disk(2 * size_um /
+    pixel_scale_um)`, `etiquetas_deteccion.py`) -- el mismo ancho que ya usan las
+    mascaras de Mask2Former/YOLO+SAM3, asi que la definicion de "cruce" es
+    comparable entre pipelines. Si se llama con `dilatar=False` en otro lado, el
+    conteo de solape cambia -- documentar cual se uso, mismo espiritu que SS3.4."""
+    from axonal_tracking import etiquetas_deteccion as ed
+
+    ids_mov = sorted(ed.ids_que_se_mueven(positions, pixel_scale_um, min_desplazamiento_px))
+    mascaras = {pid: ed.mascara_traza(positions, pid, pixel_scale_um, shape) for pid in ids_mov}
+    ambiguos: set[int] = set()
+    for i, j in itertools.combinations(ids_mov, 2):
+        solape = int(np.logical_and(mascaras[i], mascaras[j]).sum())
+        if solape >= solape_px:
+            ambiguos.add(i)
+            ambiguos.add(j)
+    return ambiguos
 
 
 # --------------------------------------------------------------------------- #

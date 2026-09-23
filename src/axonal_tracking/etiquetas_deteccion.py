@@ -237,7 +237,22 @@ def mascara_traza(
     # dilatar por ~2 sigma para cubrir el nucleo brillante del blob gaussiano (la caja
     # usa ~3 sigma, FACTOR_ANCHO; la mascara queda algo mas ajustada, dentro de la caja).
     ancho_px = max(int(round(2.0 * float(sub["size_um"].mean()) / pixel_scale_um)), 1)
-    return binary_dilation(mask, structure=disk(ancho_px))
+
+    # Dilatar SOLO la caja envolvente de la traza, no el lienzo entero. Una traza es
+    # una banda fina: dilatar (T, L) completo por cada particula es O(n_particulas x
+    # T x L) y era el 60% del costo de CPU de `datos_pixel.construir_targets`
+    # (medido: 0.62 s de 1.04 s en 6 muestras). El resultado es identico porque el
+    # margen es el radio del elemento estructurante y `binary_dilation` rellena el
+    # borde con 0, igual que el vacio de afuera de la caja.
+    filas, cols = np.nonzero(mask)
+    if len(filas) == 0:  # traza enteramente fuera del lienzo: nada que dilatar
+        return mask
+    f0 = max(int(filas.min()) - ancho_px, 0)
+    f1 = min(int(filas.max()) + ancho_px + 1, T)
+    c0 = max(int(cols.min()) - ancho_px, 0)
+    c1 = min(int(cols.max()) + ancho_px + 1, L)
+    mask[f0:f1, c0:c1] = binary_dilation(mask[f0:f1, c0:c1], structure=disk(ancho_px))
+    return mask
 
 
 @dataclass
