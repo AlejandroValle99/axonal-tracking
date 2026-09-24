@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -55,6 +54,16 @@ __all__ = [
     "resumen_mps",
 ]
 
+# Multiplo al que se paddean las entradas. **1 = sin padding, y es el default a
+# proposito**: la maquinaria esta implementada y verificada (con multiplo=1, o con
+# entradas que ya son multiplo, la salida es identica bit a bit), pero con padding
+# real todavia queda una fuga en la banda de filas pegada al relleno: las
+# convoluciones 1x1 laterales tienen bias, asi que `lat(0) = bias != 0` y vuelven a
+# llenar el relleno que `_cero_fuera` habia puesto en cero, y la 3x3 siguiente lo lee
+# en el borde de la region valida. Medido a multiplo 128 sobre (192,1024): error
+# relativo mediano 3e-3 (numerico, SDPA toma otro kernel con mascara) y ~4e-2 en el
+# ultimo 12% de las filas. Hasta cerrar eso, padding es opt-in.
+MULTIPLO_PADDING = 1
 PARCHE = 32  # stride total del stem (ver StemSolapado: 32 divide la memoria de atencion por 16)
 D_EMBEDDING = 8  # dimension del head de embedding (SS2.5)
 N_CLASES_TRACKNESS = 3  # fondo / estatica / movil
@@ -166,6 +175,77 @@ def aplicar_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     return (xf * cos + _rotar_mitad(xf) * sin).to(x.dtype)
 
 
+class GroupNormEnmascarada(nn.GroupNorm):
+    """`nn.GroupNorm` que calcula media/varianza SOLO sobre la region valida.
+
+    Existe porque la entrada se paddea a multiplos fijos (`MULTIPLO_PADDING`) para
+    que MPS no recompile un grafo por forma -- y una GroupNorm normal promediaria
+    tambien los ceros del padding, cambiando las estadisticas segun cuanto padding
+    le toco a cada muestra. Medido sobre el modelo sin esto: paddear a multiplos de
+    64 movia la salida un 48.7% relativo.
+
+    `valido_hw` es la esquina `(h, w)` de la region real (el padding va siempre
+    abajo y a la derecha), asi que alcanza con un slice -- no hace falta una mascara
+    booleana. Con `valido_hw=None` se comporta exactamente como `nn.GroupNorm`."""
+
+    def forward(self, x: torch.Tensor, valido_hw: tuple[int, int] | None = None) -> torch.Tensor:
+        if valido_hw is None:
+            return super().forward(x)
+        h, w = valido_hw
+        b, c, alto, ancho = x.shape
+        if (h, w) == (alto, ancho):
+            return super().forward(x)
+        xg = x.reshape(b, self.num_groups, c // self.num_groups, alto, ancho)
+        sub = xg[..., :h, :w]
+        media = sub.mean(dim=(2, 3, 4), keepdim=True)
+        var = sub.var(dim=(2, 3, 4), unbiased=False, keepdim=True)
+        xn = ((xg - media) / torch.sqrt(var + self.eps)).reshape(b, c, alto, ancho)
+        return xn * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def _replicar_borde(x: torch.Tensor, valido_hw: tuple[int, int] | None) -> torch.Tensor:
+    """Rellena la zona de padding replicando el ultimo pixel valido.
+
+    Va JUSTO ANTES de cada interpolacion. Al subir de escala, el interpolador que
+    cae sobre la ultima fila/columna valida lee tambien la siguiente: en el camino
+    sin padding esa no existe y se hace clamp al borde, pero con padding lee un cero
+    y mete un escalon. Replicando el borde, las dos rutas ven lo mismo.
+
+    Se implementa con indices clampeados y no con `F.pad(mode='replicate')` porque
+    el tamano de salida queda fijo -- que es todo el punto de paddear."""
+    if valido_hw is None:
+        return x
+    h, w = valido_hw
+    alto, ancho = x.shape[-2:]
+    if (h, w) == (alto, ancho):
+        return x
+    r = torch.arange(alto, device=x.device).clamp(max=h - 1)
+    c = torch.arange(ancho, device=x.device).clamp(max=w - 1)
+    return x[..., r, :][..., :, c]
+
+
+def _cero_fuera(x: torch.Tensor, valido_hw: tuple[int, int] | None) -> torch.Tensor:
+    """Pone en 0 todo lo que esta fuera de la region valida.
+
+    Imprescindible despues de CADA norma: la norma deja el relleno en
+    `(0 - media)/std * gamma + beta`, que **no es cero**, y la convolucion siguiente
+    lo lee al llegar al borde de la region valida -- contaminando resultados que
+    deberian ser identicos al caso sin padding. Con el relleno en cero, la conv ve
+    exactamente lo mismo que ve en el borde real de la imagen (su propio zero-pad)."""
+    if valido_hw is None:
+        return x
+    h, w = valido_hw
+    if (h, w) == tuple(x.shape[-2:]):
+        return x
+    mascara = x.new_zeros(1, 1, x.shape[-2], x.shape[-1])
+    mascara[..., :h, :w] = 1.0
+    return x * mascara
+
+
 # --------------------------------------------------------------------------- #
 # SS2.1 -- stem solapado
 # --------------------------------------------------------------------------- #
@@ -175,6 +255,9 @@ class SalidaStem:
     grilla: tuple[int, int]  # (Tp, Lp)
     skip_s2: torch.Tensor  # (1, 64, T/2, L/2)
     skip_s4: torch.Tensor  # (1, 128, T/4, L/4)
+    val_s2: tuple[int, int]  # extent REAL (sin padding) a stride 2
+    val_s4: tuple[int, int]  # idem a stride 4
+    val_grilla: tuple[int, int]  # idem en la grilla de tokens
 
 
 class StemSolapado(nn.Module):
@@ -196,24 +279,33 @@ class StemSolapado(nn.Module):
             raise ValueError(f"parche debe ser 16 o 32, recibido {parche}")
         self.parche = parche
         self.conv1 = nn.Conv2d(1, c1, kernel_size=7, stride=2, padding=3)
-        self.norm1 = nn.GroupNorm(8, c1)
+        self.norm1 = GroupNormEnmascarada(8, c1)
         self.conv2 = nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1)
-        self.norm2 = nn.GroupNorm(8, c2)
+        self.norm2 = GroupNormEnmascarada(8, c2)
         self.conv3 = nn.Conv2d(c2, d, kernel_size=7, stride=4, padding=3)
         self.conv4 = (
             nn.Conv2d(d, d, kernel_size=3, stride=2, padding=1) if parche == 32 else None
         )
         self.norm3 = nn.LayerNorm(d)
 
-    def forward(self, kymo: torch.Tensor) -> SalidaStem:
-        h1 = F.gelu(self.norm1(self.conv1(kymo)))  # s2
-        h2 = F.gelu(self.norm2(self.conv2(h1)))  # s4
-        h3 = self.conv3(h2)  # s16
+    def forward(self, kymo: torch.Tensor, valido_hw: tuple[int, int] | None = None) -> SalidaStem:
+        """`valido_hw` = `(T, L)` reales del kymografo dentro del tensor paddeado."""
+        alto, ancho = kymo.shape[-2:]
+        t_real, l_real = valido_hw or (alto, ancho)
+        v2 = (_ceil_div(t_real, 2), _ceil_div(l_real, 2))
+        v4 = (_ceil_div(t_real, 4), _ceil_div(l_real, 4))
+        vg = (_ceil_div(t_real, self.parche), _ceil_div(l_real, self.parche))
+
+        h1 = _cero_fuera(F.gelu(self.norm1(self.conv1(kymo), v2)), v2)  # s2
+        h2 = _cero_fuera(F.gelu(self.norm2(self.conv2(h1), v4)), v4)  # s4
+        h3 = _cero_fuera(self.conv3(h2), (_ceil_div(t_real, 16), _ceil_div(l_real, 16)))  # s16
         if self.conv4 is not None:
-            h3 = self.conv4(F.gelu(h3))  # s32
+            h3 = _cero_fuera(self.conv4(F.gelu(h3)), vg)  # s32
         _, d, tp, lp = h3.shape
         tokens = h3.flatten(2).transpose(1, 2).reshape(tp * lp, d)
-        return SalidaStem(self.norm3(tokens), (tp, lp), h1, h2)
+        # norm3 es LayerNorm sobre CANALES por token: no mira el espacio, asi que el
+        # padding no la afecta y no hace falta enmascararla.
+        return SalidaStem(self.norm3(tokens), (tp, lp), h1, h2, v2, v4, vg)
 
 
 # --------------------------------------------------------------------------- #
@@ -283,14 +375,15 @@ class DecoderFPN(nn.Module):
     def __init__(self, d_enc: int = 384, c_s4: int = 128, c_s2: int = 64, d_salida: int = 64):
         super().__init__()
         self.lat_s4 = nn.Conv2d(c_s4, 192, 1)
-        self.fuse_s4 = nn.Sequential(nn.Conv2d(192, 192, 3, padding=1), nn.GroupNorm(8, 192), nn.GELU())
+        self.conv_s4 = nn.Conv2d(192, 192, 3, padding=1)
+        self.norm_s4 = GroupNormEnmascarada(8, 192)
         self.red_enc = nn.Conv2d(d_enc, 192, 1)
         self.lat_s2 = nn.Conv2d(c_s2, 96, 1)
         self.red_s4 = nn.Conv2d(192, 96, 1)
-        self.fuse_s2 = nn.Sequential(nn.Conv2d(96, 96, 3, padding=1), nn.GroupNorm(8, 96), nn.GELU())
-        self.salida = nn.Sequential(
-            nn.Conv2d(96, d_salida, 3, padding=1), nn.GroupNorm(8, d_salida), nn.GELU()
-        )
+        self.conv_s2 = nn.Conv2d(96, 96, 3, padding=1)
+        self.norm_s2 = GroupNormEnmascarada(8, 96)
+        self.conv_salida = nn.Conv2d(96, d_salida, 3, padding=1)
+        self.norm_salida = GroupNormEnmascarada(8, d_salida)
 
     @staticmethod
     def _subir_a(x: torch.Tensor, destino: torch.Tensor) -> torch.Tensor:
@@ -299,7 +392,7 @@ class DecoderFPN(nn.Module):
         y las formas dejan de calzar."""
         return F.interpolate(x, size=destino.shape[-2:], mode="bilinear", align_corners=False)
 
-    def forward(self, enc_s16, skip_s4, skip_s2):
+    def forward(self, enc_s16, skip_s4, skip_s2, val_enc=None, val_s4=None, val_s2=None):
         """Devuelve features a **stride 2**, no a resolucion completa.
 
         Subir a full ANTES de los heads era el mayor consumidor de memoria del
@@ -310,10 +403,28 @@ class DecoderFPN(nn.Module):
         La precision subpixel no se pierde porque no sale de la grilla del decoder
         sino de `evaluacion.extraer_subpixel`, que calcula un centroide pesado por
         intensidad por fila sobre la mascara full-res y el kymografo."""
-        h = self.red_enc(enc_s16)
-        h = self.fuse_s4(self._subir_a(h, skip_s4) + self.lat_s4(skip_s4))
-        h = self.fuse_s2(self._subir_a(self.red_s4(h), skip_s2) + self.lat_s2(skip_s2))
-        return self.salida(h)
+        # Dos reglas distintas segun que consuma el tensor, y hay que respetarlas o
+        # el padding se filtra al borde de la region valida:
+        #   - antes de una INTERPOLACION -> replicar el borde: el interpolador que
+        #     cae sobre la ultima fila valida lee la siguiente, y sin padding esa no
+        #     existe y se hace clamp. Replicar reproduce ese clamp.
+        #   - antes de una CONVOLUCION 3x3 -> poner en cero: es lo que la conv ve en
+        #     el borde real de la imagen (su propio zero-pad). No alcanza con haber
+        #     puesto ceros antes: las 1x1 laterales tienen bias, asi que `lat(0)=bias`
+        #     vuelve a llenar el relleno. Por eso se cerea la SUMA, no los sumandos.
+        # `val_enc` viene del stem (`SalidaStem.val_grilla`) y NO se deriva de
+        # `val_s4`: la grilla del encoder esta a stride `parche`, que es 32 o 16
+        # segun la config. Derivarla mal hace que `_replicar_borde` reciba un extent
+        # mayor que el tensor y no haga nada, en silencio.
+        h = _replicar_borde(self.red_enc(enc_s16), val_enc)
+        suma = self._subir_a(h, skip_s4) + self.lat_s4(skip_s4)
+        h = self.conv_s4(_cero_fuera(suma, val_s4))
+        h = _cero_fuera(F.gelu(self.norm_s4(h, val_s4)), val_s4)
+        h = _replicar_borde(self.red_s4(h), val_s4)
+        suma = self._subir_a(h, skip_s2) + self.lat_s2(skip_s2)
+        h = self.conv_s2(_cero_fuera(suma, val_s2))
+        h = _cero_fuera(F.gelu(self.norm_s2(h, val_s2)), val_s2)
+        return _cero_fuera(F.gelu(self.norm_salida(self.conv_salida(h), val_s2)), val_s2)
 
 
 # --------------------------------------------------------------------------- #
@@ -346,10 +457,12 @@ class KymoRoPE(nn.Module):
         d_emb: int = D_EMBEDDING,
         parche: int = PARCHE,
         usar_checkpoint: bool = False,
+        multiplo_padding: int = MULTIPLO_PADDING,
     ):
         super().__init__()
         self.d = d
         self.parche = parche
+        self.multiplo_padding = multiplo_padding
         self.usar_checkpoint = usar_checkpoint
         self.stem = StemSolapado(d=d, parche=parche)
         self.rope = RoPE2DFisica(d // n_cabezas)
@@ -389,7 +502,25 @@ class KymoRoPE(nn.Module):
         calculan igual y se descartan al cortar por `longitudes`. Asi ninguna fila de
         la mascara queda toda en False, que es lo que haria NaN en SDPA."""
         device = next(self.parameters()).device
-        stems = [self.stem(m.kymo.unsqueeze(0).to(device)) for m in muestras]
+        mult = self.multiplo_padding
+
+        # Padding a multiplos fijos: MPS compila un grafo por FORMA, y las 800
+        # muestras del dataset tienen 800 formas distintas. Medido con el mismo
+        # trabajo total: 24 formas distintas cuestan 0.686 s/paso y +4.44 GB de pool,
+        # contra 0.091 s/paso y +0.05 GB repitiendo una sola forma (7.5x y 89x).
+        # Las normas del stem/decoder son `GroupNormEnmascarada`, asi que el relleno
+        # no entra en sus estadisticas; los tokens de relleno se enmascaran en la
+        # atencion; y las salidas se recortan al final. No es un resize: no hay
+        # interpolacion ni cambio de aspect ratio.
+        tamanos = [tuple(m.kymo.shape[-2:]) for m in muestras]
+        stems = []
+        for m, (t, l) in zip(muestras, tamanos):
+            k = m.kymo.unsqueeze(0).to(device)
+            tp, lp = _ceil_div(t, mult) * mult, _ceil_div(l, mult) * mult
+            if (tp, lp) != (t, l):
+                k = F.pad(k, (0, lp - l, 0, tp - t))
+            stems.append(self.stem(k, valido_hw=(t, l)))
+
         longitudes = [s.tokens.shape[0] for s in stems]
         b, n_max = len(stems), max(longitudes)
 
@@ -402,10 +533,17 @@ class KymoRoPE(nn.Module):
             x[i, :n] = s.tokens
             t_seg, x_um = self._coords_fisicas(s.grilla, m.dt_segundos, m.dx_um, device)
             cos[i, :n], sin[i, :n] = self.rope(t_seg, x_um)
-            valido[i, :n] = True
+            # los tokens validos son un SUB-RECTANGULO de la grilla paddeada, no un
+            # prefijo contiguo: hay que armarlo en 2D y recien despues aplanar
+            gt, gl = s.grilla
+            vt, vl = s.val_grilla
+            m2d = torch.zeros(gt, gl, dtype=torch.bool, device=device)
+            m2d[:vt, :vl] = True
+            valido[i, :n] = m2d.reshape(-1)
 
-        # (B, 1, 1, N_max): mascara de CLAVE, difunde sobre cabezas y queries
-        mascara = valido[:, None, None, :] if b > 1 else None
+        # (B, 1, 1, N_max): mascara de CLAVE, difunde sobre cabezas y queries.
+        # Ahora hace falta aunque B==1, porque el padding mete tokens invalidos.
+        mascara = valido[:, None, None, :] if not bool(valido.all()) else None
 
         for bloque in self.bloques:
             if self.usar_checkpoint and self.training:
@@ -419,20 +557,26 @@ class KymoRoPE(nn.Module):
             tokens = x[i, : longitudes[i]]
             tp, lp = s.grilla
             enc = tokens.transpose(0, 1).reshape(1, self.d, tp, lp)
-            feats = self.decoder(enc, s.skip_s4, s.skip_s2)  # stride 2
-            tamano = tuple(m.kymo.shape[-2:])
+            enc = _cero_fuera(enc, s.val_grilla)  # idem: los tokens de relleno no aportan
+            feats = self.decoder(enc, s.skip_s4, s.skip_s2, s.val_grilla, s.val_s4, s.val_s2)
+            t_real, l_real = tamanos[i]
+            alto_pad, ancho_pad = feats.shape[-2] * 2, feats.shape[-1] * 2
 
-            # los heads corren a stride 2 y se sube el LOGIT (ver DecoderFPN.forward).
-            # La normalizacion de orientacion va DESPUES de subir: interpolar dos
-            # vectores unitarios no da uno unitario.
-            subir = partial(F.interpolate, size=tamano, mode="bilinear", align_corners=False)
+            # Se sube dentro de la grilla PADDEADA (forma fija, no recompila) y recien
+            # despues se recorta a (T, L) -- el recorte es un slice, no genera grafo.
+            # Subir directo a (T, L) seria un resize: cambiaria la escala.
+            def subir(t, _tam=(alto_pad, ancho_pad), _v=s.val_s2):
+                return F.interpolate(
+                    _replicar_borde(t, _v), size=_tam, mode="bilinear", align_corners=False
+                )
+            rec = (..., slice(None, t_real), slice(None, l_real))
             salidas.append(
                 SalidaKymoRoPE(
-                    trackness=subir(self.head_trackness(feats)).squeeze(0),
-                    embedding=subir(self.head_embedding(feats)).squeeze(0),
+                    trackness=subir(self.head_trackness(feats))[rec].squeeze(0),
+                    embedding=subir(self.head_embedding(feats))[rec].squeeze(0),
                     orientacion=F.normalize(
                         subir(self.head_orientacion(feats)), dim=1, eps=1e-6
-                    ).squeeze(0),
+                    )[rec].squeeze(0),
                 )
             )
         return salidas
