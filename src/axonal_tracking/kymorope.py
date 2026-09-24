@@ -47,11 +47,17 @@ __all__ = [
     "RoPE2DFisica",
     "SalidaKymoRoPE",
     "dispositivo_preferido",
+    "memoria_asignada",
+    "memoria_reservada",
+    "memoria_total",
     "perdida_discriminativa",
     "perdida_orientacion",
     "perdida_total",
     "perdida_trackness",
+    "resumen_dispositivo",
     "resumen_mps",
+    "sincronizar",
+    "vaciar_cache",
 ]
 
 # Multiplo al que se paddean las entradas. **1 = sin padding, y es el default a
@@ -88,17 +94,81 @@ def dispositivo_preferido() -> torch.device:
     return torch.device("cpu")
 
 
-def resumen_mps() -> dict[str, object]:
-    """Estado de MPS + memoria asignada, para los chequeos del notebook."""
-    info: dict[str, object] = {
-        "disponible": torch.backends.mps.is_available(),
-        "compilado": torch.backends.mps.is_built(),
-        "torch": torch.__version__,
-    }
-    if torch.backends.mps.is_available():
-        info["asignado_mb"] = round(torch.mps.current_allocated_memory() / 1e6, 1)
-        info["driver_mb"] = round(torch.mps.driver_allocated_memory() / 1e6, 1)
+def _tipo(device=None) -> str:
+    return torch.device(device).type if device is not None else dispositivo_preferido().type
+
+
+def sincronizar(device=None) -> None:
+    """Espera a que el backend termine. Sin esto, cualquier `time.time()` alrededor
+    de una operacion en GPU mide el encolado, no el calculo."""
+    t = _tipo(device)
+    if t == "cuda":
+        torch.cuda.synchronize()
+    elif t == "mps":
+        torch.mps.synchronize()
+
+
+def vaciar_cache(device=None) -> None:
+    """Devuelve al backend los bloques cacheados. No libera memoria en uso."""
+    t = _tipo(device)
+    if t == "cuda":
+        torch.cuda.empty_cache()
+    elif t == "mps":
+        torch.mps.empty_cache()
+
+
+def memoria_asignada(device=None) -> int:
+    """Bytes de tensores VIVOS. Es la cifra a mirar para comparar dos configs: el
+    pool del asignador no se devuelve entre mediciones y confunde la comparacion."""
+    t = _tipo(device)
+    if t == "cuda":
+        return torch.cuda.memory_allocated()
+    if t == "mps":
+        return torch.mps.current_allocated_memory()
+    return 0
+
+
+def memoria_reservada(device=None) -> int:
+    """Bytes que el proceso le pidio al backend (pool incluido)."""
+    t = _tipo(device)
+    if t == "cuda":
+        return torch.cuda.memory_reserved()
+    if t == "mps":
+        return torch.mps.driver_allocated_memory()
+    return 0
+
+
+def memoria_total(device=None) -> int:
+    """VRAM total del dispositivo, 0 si no aplica. En CUDA decide si conviene
+    activar gradient checkpointing; en MPS la memoria es unificada y no hay un
+    tope propio del dispositivo."""
+    t = _tipo(device)
+    if t == "cuda":
+        return torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    if t == "mps" and hasattr(torch.mps, "recommended_max_memory"):
+        return torch.mps.recommended_max_memory()
+    return 0
+
+
+def resumen_dispositivo(device=None) -> dict[str, object]:
+    """Backend, nombre y memoria -- para los chequeos del notebook en cualquier GPU."""
+    dev = torch.device(device) if device is not None else dispositivo_preferido()
+    info: dict[str, object] = {"dispositivo": str(dev), "torch": torch.__version__}
+    if dev.type == "cuda":
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        info["gpu"] = props.name
+        info["vram_gb"] = round(props.total_memory / 1e9, 1)
+        info["capacidad"] = f"{props.major}.{props.minor}"
+    elif dev.type == "mps":
+        info["gpu"] = "Apple / memoria unificada"
+        info["mps_compilado"] = torch.backends.mps.is_built()
+    info["asignado_mb"] = round(memoria_asignada(dev) / 1e6, 1)
+    info["reservado_mb"] = round(memoria_reservada(dev) / 1e6, 1)
     return info
+
+
+# alias historico: el notebook lo usaba antes de que el codigo fuera portable
+resumen_mps = resumen_dispositivo
 
 
 # --------------------------------------------------------------------------- #

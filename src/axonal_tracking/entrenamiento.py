@@ -42,7 +42,7 @@ from axonal_tracking.datos_pixel import (
     agrupar_por_tokens,
     collate_empaquetado,
 )
-from axonal_tracking.kymorope import PARCHE, KymoRoPE, perdida_total
+from axonal_tracking.kymorope import PARCHE, KymoRoPE, memoria_total, perdida_total
 
 _RAIZ = Path(__file__).resolve().parents[2]
 if str(_RAIZ / "notebooks") not in sys.path:
@@ -209,6 +209,34 @@ class TrainerKymoRoPE(Trainer):
     def compute_eval_loss(self, batch):
         return self._perdida_lote(self._mover(batch), use_amp=False, dtype=torch.float32)["total"]
 
+    def cargar_checkpoint(self, ruta: str | Path, *, estricto: bool = True) -> int:
+        """Restaura modelo, optimizador, scheduler y scaler. Devuelve el `step`.
+
+        `Trainer.save_checkpoint` escribia sin que nadie leyera: una corrida cortada
+        (limite de sesion en Colab, kernel reiniciado, corte de luz) se perdia
+        entera. Con esto se reanuda desde el ultimo `checkpoint_final.pt`.
+
+        `estricto=False` tolera que no calce el estado del optimizador -- util para
+        arrancar de los pesos de otra corrida sin heredar su momento."""
+        ruta = Path(ruta)
+        if not ruta.exists():
+            raise FileNotFoundError(f"No existe el checkpoint {ruta}")
+        # `weights_only=False`: el checkpoint trae estados de optimizador/scheduler,
+        # no solo tensores. Es un archivo propio, no de terceros.
+        ck = torch.load(ruta, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(ck["model_state_dict"])
+        if ck.get("optimizer_state_dict") is not None:
+            try:
+                self.optimizer.load_state_dict(ck["optimizer_state_dict"])
+            except ValueError:
+                if estricto:
+                    raise
+        if ck.get("scheduler_state_dict") is not None:
+            self.scheduler.load_state_dict(ck["scheduler_state_dict"])
+        if ck.get("scaler_state_dict") is not None and self.scaler is not None:
+            self.scaler.load_state_dict(ck["scaler_state_dict"])
+        return int(ck.get("step", 0))
+
     def desglose_medio(self) -> dict[str, float]:
         """Media del desglose acumulado y reinicio del acumulador. Se mira por
         separado a proposito: si el embedding colapsa mientras el trackness baja, el
@@ -252,6 +280,7 @@ def construir_entrenador(
     dispositivo=None,
     save_dir: Path | str | None = None,
     usar_checkpoint: bool | None = None,
+    reanudar: bool | str | Path = False,
 ) -> tuple[TrainerKymoRoPE, dict]:
     """Arma datasets, samplers, modelo, optimizador, scheduler y el `Trainer`.
 
@@ -304,7 +333,12 @@ def construir_entrenador(
         # Jupyter. Se puede subir a mano si el cache esta frio.
         num_workers = 0
     if usar_checkpoint is None:
-        usar_checkpoint = torch.device(dev).type == "mps"
+        # Decidir por MEMORIA, no por el nombre del backend. En MPS siempre: SDPA
+        # materializa la matriz de atencion completa (no hay kernel fusionado) y eso
+        # domina el consumo. En CUDA hay FlashAttention, asi que solo hace falta con
+        # VRAM chica -- un 3060 de 6 GB si, un T4/A100 no.
+        tipo = torch.device(dev).type
+        usar_checkpoint = tipo == "mps" or (tipo == "cuda" and memoria_total(dev) < 12e9)
     raiz = Path(raiz_datasets)
 
     fps_train = None
@@ -387,8 +421,19 @@ def construir_entrenador(
         gradient_accumulation_steps=gradient_accumulation_steps,
         save_dir=save_dir or (_RAIZ / "results" / "kymorope" / "checkpoints"),
     )
+    paso_inicial = 0
+    if reanudar:
+        base = Path(save_dir or (_RAIZ / "results" / "kymorope" / "checkpoints"))
+        ruta = base / "checkpoint_final.pt" if reanudar is True else Path(reanudar)
+        if ruta.exists():
+            paso_inicial = entrenador.cargar_checkpoint(ruta)
+            print(f"reanudado desde {ruta} (step {paso_inicial})")
+        else:
+            print(f"reanudar activo pero no hay checkpoint en {ruta}: se arranca de cero")
+
     info = {
         "dispositivo": str(dev),
+        "paso_inicial": paso_inicial,
         "n_train": len(train),
         "n_val": len(val),
         "fps_train": sorted(set(train.fps())),

@@ -21,7 +21,7 @@ This repository collects experiments across several evaluation branches:
 |----------|------|--------|
 | **Transformers over raw video** | Segmentation with SAM2 / SAM3 guided by detectors (blob_log, Grounding DINO) directly on the VSI stack | Prototypes (NB02, NB04) |
 | **SAM3 for axon ROI detection** | Temporal max-projection of synthetic video + SAM3 to automatically detect the axon ROI, compared against GT | Active (NB03) |
-| **Transformers over kymographs** | Same model family, but operating on the kymograph image instead of the video | Exploration |
+| **Transformers over kymographs** | Detect-then-segment (YOLO+SAM3, NB07–09), Mask2Former segmentation (NB10), and segment-level association via attention (NB11) — all measured against KymoButler on the same 400-sample synthetic split | Closed, negative result (NB07–11; see `plan/notebooks-08-09-closeout.md`, `docs/revision-rumbo-vit.md`, `plan/notebook11-closeout.md`) |
 | **KymoButler baseline** | U-Net + classical tracker (Jakobs, Franze & Bhatt 2019, *eLife*) over kymographs | Baseline (NB06) |
 | **Synthetic kymographs** | Generation of kymographs with exact ground truth to validate trackers at progressive difficulty | Active (NB05) |
 | **Classical preprocessing** | VSI/ETS reading, background subtraction, kymograph extraction | Support (NB01) |
@@ -45,6 +45,11 @@ notebooks/   Experiments, one per approach/stage
   08_deteccion_yolo.ipynb       YOLO track detection (Stage 1) — frozen, negative-result baseline
   09_segmentacion_transformer.ipynb  SAM3 per-track masks from YOLO boxes (Stage 2) — frozen,
                                 negative-result baseline (see plan/notebooks-08-09-closeout.md)
+  10_mask2former_kymografo.ipynb  Mask2Former segmentation vs KymoButler — frozen, negative-result
+                                baseline (see docs/revision-rumbo-vit.md)
+  11_asociacion_atencion.ipynb  Classical cost + global attention over KymoButler's own segments,
+                                replacing DecNet's greedy-local association — frozen, negative-result
+                                baseline (see plan/notebook11-closeout.md)
 src/axonal_tracking/   Support modules reused by the notebooks
   ets_reader.py, preprocesamiento.py, kimografo.py,
   kimografo_sintetico.py, configuracion.py, visualizacion.py, ...

@@ -26,7 +26,11 @@ uv run python scripts/ver_video.py [ruta/al/Movie_NNN.vsi]   # view a video in n
 uv run python scripts/extraer_frames_etiquetado.py            # sample frames for Roboflow/CVAT labeling
 ```
 
-There is no test suite, linter, or build step configured in this repo — don't invent one unless asked.
+`scripts/` has additional one-off utilities beyond the two above (synthetic dataset generation,
+detection-label export/visualization, pipeline diagrams) — check there before writing a new script.
+
+There is no test suite or build step configured in this repo — don't invent one unless asked.
+Linting: `uv run ruff check .` (config in `pyproject.toml`'s `[tool.ruff]`).
 
 Two sibling repos are pulled in as **editable path dependencies** (`[tool.uv.sources]` in
 `pyproject.toml`) and must exist as checkouts next to this repo for `uv sync` to work:
@@ -50,6 +54,29 @@ Numbered notebooks form the experimental pipeline, in rough dependency order:
 | `04_sam3_prototipo.ipynb` | SAM3 segmentation directly on video | Prototype |
 | `05_kimografo.ipynb` | Synthetic kymograph generation + exact ground truth | Active |
 | `06_tracking_kymobutler.ipynb` | KymoButler tracking on (synthetic) kymographs vs GT | Baseline |
+| `07_validacion_prompts_sam3.ipynb` | Cheap box- vs point-prompt validation for SAM3 before committing to the detect-then-segment build (Paso 4.0 of `plan/detection-segmentation-guide.md`) | Done (fed 08–09) |
+| `08_deteccion_yolo.ipynb` | YOLO detector locates each kymograph track as a box (Stage 1 of detect-then-segment) | Baseline (negative result, frozen) |
+| `09_segmentacion_transformer.ipynb` | SAM3 turns YOLO's boxes into a per-track mask (Stage 2 of detect-then-segment) | Baseline (negative result, frozen) |
+| `10_mask2former_kymografo.ipynb` | Mask2Former segmentation on (synthetic) kymographs, vs KymoButler | Baseline (negative result, frozen) |
+| `11_asociacion_atencion.ipynb` | Classical cost + global attention over KymoButler's own segments, replacing DecNet's greedy-local association | Baseline (negative result, frozen) |
+
+Notebooks 07–09 implement the "detect-then-segment" architecture described in
+`plan/detection-segmentation-guide.md` (YOLO detector → SAM3 segmenter), which maps to
+WBS items 5–6 of the formal thesis plan (`plan/Plan-Proyecto.pdf`). **This pipeline is closed
+as a documented negative result** — frozen SAM3 assigns identity at chance on crossings
+regardless of prompting (measured in NB09 §6–7; verdict and remaining-work list in
+`plan/notebooks-08-09-closeout.md`). The successor, `plan/mask2former-guide.md` (notebook 10),
+is **also closed as a negative result**: on the same 400-sample synthetic split, KymoButler
+beats it on all three axes (F1 0.968 vs 0.899, ID-switch 9.9% vs 34.6%, position error 0.053 µm
+vs 0.119 — `docs/revision-rumbo-vit.md` §2bis). That measurement pointed at KymoButler's
+explicit association stage as the structural difference, which motivated notebook 11 — giving
+the same segment representation an explicit association stage (classical cost, then global
+attention, with and without DecNet's own visual tiles). **Notebook 11 is also a negative
+result**: none of the three candidate rows passes Gate B, and DecNet's greedy-local design
+remains unbeaten on ID-switch at every difficulty stratum (`plan/notebook11-closeout.md`,
+`docs/revision-rumbo-vit.md` update of 2026-09-17). The remaining escalation the plan allows is
+the per-pixel embedding head in `plan/kymotransformer-proposal.md` §3 — a change to the
+representation, not the association reasoning.
 
 This list shifts as notebooks get renumbered/split (see git history for current numbering — it has
 moved before). When adding a new approach, follow the `NN_descripcion.ipynb` convention and update
@@ -84,6 +111,8 @@ moved before). When adding a new approach, follow the `NN_descripcion.ipynb` con
 - `visualizacion.py` — matplotlib helpers for frames/masks/blobs/boxes; all take an optional `ax` to
   compose into larger layouts. Default contrast stretch matches `preprocesamiento.frame_a_rgb_uint8`
   (p50-p99.8).
+- `etiquetas_deteccion.py` — exports detection/segmentation labels from synthetic synthkymo datasets
+  to train the YOLO detector and/or SAM3 segmenter (notebooks 07-09's data layer).
 
 ### `config.yaml` — synthetic kymograph generation parameters
 
@@ -104,8 +133,18 @@ Read before touching the related code:
 - `parametros-experimentales.md` — backs `parametros.py`.
 - `alternativa-java-bioformats.md` — notes on the Bio-Formats/Java alternative that `ets_reader.py`
   avoids needing.
+- `handover.md` — handover notes for picking the project back up.
+- `regenerar-dataset-sintetico.md` — how to regenerate the synthetic kymograph dataset.
+- `synthkymo-axon-path-followup.md` — follow-up notes on `synthkymo` axon-path generation.
+- `KymoTransformer_Research_Proposal.md` — research proposal backing
+  `plan/kymotransformer-proposal.md` (pre-existing exception to the naming convention below).
 
 New docs in this directory should follow the same convention: Spanish, kebab-case filenames.
+
+`docs/`, `plan/`, `transcripts/`, and `data/` are gitignored — a fresh clone won't have them. They
+hold private thesis-in-progress material (design docs, meeting notes, raw data) rather than
+code, so treat file references into these directories as accurate for the current checkout, not
+guaranteed to exist elsewhere.
 
 ### `transcripts/`
 
