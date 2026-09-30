@@ -7,11 +7,18 @@ estaticas, asi que no es comparable con las filas de `plan/notebooks-08-09-close
 (YOLO+SAM3) ni con la de `docs/revision-rumbo-vit.md` (Mask2Former). Sin esta corrida no
 hay tabla de tesis. Ver `docs/revision-rumbo-vit.md` SS4.
 
-Salida: results/kymobutler/trayectorias_400.csv + resumen_400.json
+Salida (split `test`, el default): results/kymobutler/trayectorias_400_*.csv + resumen_400.json.
+Otros splits escriben `trayectorias_{split}_*.csv` + `resumen_{split}.json`, asi la cifra
+publicada de test no se pisa. Todos guardan ademas `polilineas_{split}_{variante}.pkl`
+(polilineas por muestra, ya filtradas por variante) para superponerlas en NB13.
+
+Uso: uv run python scripts/evaluar_kymobutler_400.py [--split val] [--device cpu]
 """
 from __future__ import annotations
 
+import argparse
 import json
+import pickle
 import sys
 import time
 import traceback
@@ -19,8 +26,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import tifffile
-import yaml
 from PIL import Image
 
 RAIZ = Path(__file__).resolve().parents[1]
@@ -36,9 +41,8 @@ from axonal_tracking import evaluacion as ev
 
 KYMOBUTLER_DIR = Path(kymobutler.__file__).resolve().parents[2]
 MODELOS_DIR = KYMOBUTLER_DIR / "models"
-SPLIT_DIR = RAIZ / "datasets" / "test"
 SALIDA = RAIZ / "results" / "kymobutler"
-DEVICE = "cpu"
+DEVICE = "cpu"  # default de `main`; `--device` lo cambia (cpu = el que dio la cifra publicada)
 
 # Mismo umbral movil/estatico que NB08/09/10 -- si esto cambia, la comparacion deja de
 # ser el mismo criterio (ver docstring de ed.MIN_DESPLAZAMIENTO_PX_MOVIL).
@@ -46,25 +50,19 @@ MIN_DESP = ed.MIN_DESPLAZAMIENTO_PX_MOVIL
 
 
 def cargar_escena(sample_dir: Path) -> dict:
-    """Igual que `cargar_sample` de NB06, pero devolviendo el dict que espera el harness."""
-    kymo = tifffile.imread(sample_dir / "kymograph.tif")
-    if kymo.ndim == 3:
-        kymo = kymo[..., 0]
-    png = sample_dir / "kymograph.png"
+    """Igual que `cargar_sample` de NB06, pero devolviendo el dict que espera el harness.
+    La carga vive en `ev.cargar_escena_sintetica`; aca solo se agrega el PNG que lee
+    KymoButler (lo importan evaluar_gate_a, preparar_cache y NB11: no renombrar)."""
+    escena = ev.cargar_escena_sintetica(sample_dir)
+    png = Path(sample_dir) / "kymograph.png"
     if not png.exists():
-        Image.fromarray(kymo, mode="L").save(png)
-    cfg = yaml.safe_load((sample_dir / "config.yaml").read_text())
-    return {
-        "nombre": sample_dir.name,
-        "kymo": kymo,
-        "png": png,
-        "positions": pd.read_csv(sample_dir / "positions.csv"),
-        "pixel_scale_um": float(cfg["general"]["pixel_scale_um"]),
-        "fps": float(cfg["general"]["fps"]),
-    }
+        Image.fromarray(escena["kymo"], mode="L").save(png)
+    return {**escena, "png": png}
 
 
-def polilineas_kymobutler(escena: dict, models) -> tuple[list[pd.DataFrame], float]:
+def polilineas_kymobutler(
+    escena: dict, models, device: str = DEVICE
+) -> tuple[list[pd.DataFrame], float]:
     """Tracks de KymoButler -> polilineas (frame, col_subpixel) en pixeles NATIVOS.
 
     KymoButler redimensiona internamente (`scale_factor`); NB06 compensaba escalando el
@@ -73,12 +71,12 @@ def polilineas_kymobutler(escena: dict, models) -> tuple[list[pd.DataFrame], flo
     unidades que para Mask2Former, sin tocar su logica de asociacion.
     """
     was_negated, raw, pre, pred = segment_bidirectional(
-        str(escena["png"]), models["binet"], device=DEVICE
+        str(escena["png"]), models["binet"], device=device
     )
     scale_factor = raw.shape[1] / escena["kymo"].shape[1]
     tracks = track_bidirectional(
         pred, pre, was_negated, vision_net=models["decnet"],
-        threshold=0.2, min_size=10, min_frames=10, device=DEVICE,
+        threshold=0.2, min_size=10, min_frames=10, device=device,
     )
     polis = []
     for trk in tracks:
@@ -119,22 +117,29 @@ def via_subpixel(poli: pd.DataFrame, kymo: np.ndarray) -> pd.DataFrame:
 def es_movil(poli: pd.DataFrame) -> bool:
     """Analogo, del lado de la PREDICCION, del filtro de clase `movil` que se le aplica a
     Mask2Former: KymoButler no emite clase, asi que se usa el mismo criterio de
-    desplazamiento de `ed.ids_que_se_mueven` (rango total >= MIN_DESP px)."""
-    c = poli["col_subpixel"].to_numpy()
-    return bool(len(c) and (c.max() - c.min()) >= MIN_DESP)
+    desplazamiento de `ed.ids_que_se_mueven` (rango total >= MIN_DESP px). La logica vive
+    en `ev.es_movil_polilinea`; este nombre queda porque cuatro scripts lo importan."""
+    return ev.es_movil_polilinea(poli, MIN_DESP)
 
 
-def main() -> None:
+def main(split: str = "test", device: str = DEVICE, limite: int | None = None) -> None:
     SALIDA.mkdir(parents=True, exist_ok=True)
-    models = load_default_models(model_dir=MODELOS_DIR, device=DEVICE)
-    muestras = sorted(SPLIT_DIR.glob("sample_*"))
-    print(f"{len(muestras)} muestras, device={DEVICE}", flush=True)
+    split_dir = RAIZ / "datasets" / split
+    # test conserva los nombres de archivo de la cifra publicada; el resto lleva el split.
+    # Una corrida con `limite` lleva su propio sufijo: nunca pisa un resultado completo.
+    sufijo = "400" if split == "test" else split
+    etiqueta_split = split
+    if limite:
+        sufijo, etiqueta_split = f"{sufijo}_lim{limite}", f"{split}_lim{limite}"
+    models = load_default_models(model_dir=MODELOS_DIR, device=device)
+    muestras = sorted(split_dir.glob("sample_*"))[:limite]
+    print(f"{len(muestras)} muestras de {split}, device={device}", flush=True)
 
     escenas, fallos, t0 = {}, [], time.time()
     for i, d in enumerate(muestras):
         try:
             esc = cargar_escena(d)
-            polis, sf = polilineas_kymobutler(esc, models)
+            polis, sf = polilineas_kymobutler(esc, models, device)
             escenas[d.name] = {**esc, "polilineas": polis, "scale_factor": sf}
         except Exception as exc:  # noqa: BLE001 -- una muestra rota no debe tumbar 400
             fallos.append({"muestra": d.name, "error": repr(exc)})
@@ -164,21 +169,27 @@ def main() -> None:
                 polis = [q for q in (via_subpixel(p, e["kymo"]) for p in polis) if len(q)]
             esc_ev[n] = {**e, "polilineas": polis}
         tr, res = ev.evaluar_trayectorias_polilineas(esc_ev, min_desplazamiento_px=MIN_DESP)
-        mm = tr[tr.gt_id != -1]
-        frag = mm.groupby(["muestra", "gt_id"]).size()
-        res = {**res, "fragmentos_por_gt": round(float(frag.mean()), 3),
-               "frac_gt_fragmentado": round(float((frag > 1).mean()), 3)}
+        res = {**res, **ev.resumen_fragmentacion(tr)}
         resultados[etiqueta] = res
-        tr.to_csv(SALIDA / f"trayectorias_400_{etiqueta}.csv", index=False)
-        print(f"\n=== KymoButler, 400 muestras, predicciones: {etiqueta} ===")
+        tr.to_csv(SALIDA / f"trayectorias_{sufijo}_{etiqueta}.csv", index=False)
+        with open(SALIDA / f"polilineas_{etiqueta_split}_{etiqueta}.pkl", "wb") as f:
+            pickle.dump({n: e["polilineas"] for n, e in esc_ev.items()}, f)
+        print(f"\n=== KymoButler, {len(escenas)} muestras de {split}, predicciones: {etiqueta} ===")
         for k, v in res.items():
             print(f"  {k}: {v}")
 
-    (SALIDA / "resumen_400.json").write_text(json.dumps(
-        {"resultados": resultados, "n_muestras": len(escenas), "fallos": fallos,
+    (SALIDA / f"resumen_{sufijo}.json").write_text(json.dumps(
+        {"resultados": resultados, "split": split, "device": device,
+         "n_muestras": len(escenas), "fallos": fallos,
          "min_desplazamiento_px": MIN_DESP, "thr_px_track": ev.THR_PX_TRACK}, indent=2))
     print(f"\nGuardado en {SALIDA}")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--split", default="test", help="test (default, cifra publicada), val o train")
+    ap.add_argument("--device", default=DEVICE, help="cpu (default) o cuda")
+    ap.add_argument("--limite", type=int, default=None,
+                    help="solo las primeras N muestras (prueba rapida; archivos con sufijo _limN)")
+    args = ap.parse_args()
+    main(args.split, args.device, args.limite)

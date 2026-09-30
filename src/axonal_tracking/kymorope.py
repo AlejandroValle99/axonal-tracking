@@ -33,6 +33,7 @@ RoPE por `rotate_half` real en vez de aritmetica compleja, y
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -47,6 +48,7 @@ __all__ = [
     "RoPE2DFisica",
     "SalidaKymoRoPE",
     "dispositivo_preferido",
+    "fp32_estricto",
     "memoria_asignada",
     "memoria_reservada",
     "memoria_total",
@@ -165,6 +167,38 @@ def resumen_dispositivo(device=None) -> dict[str, object]:
     info["asignado_mb"] = round(memoria_asignada(dev) / 1e6, 1)
     info["reservado_mb"] = round(memoria_reservada(dev) / 1e6, 1)
     return info
+
+
+@contextmanager
+def fp32_estricto():
+    """Apaga TF32 (convoluciones cuDNN y matmul CUDA) mientras dura el bloque.
+
+    En GPUs NVIDIA Ampere o posteriores PyTorch corre las CONVOLUCIONES float32 en
+    TF32 por defecto (mantisa de 10 bits, ~5e-4 relativo). Para entrenar da igual
+    -- bajo autocast bf16 ya es media precision -- pero rompe cualquier asercion de
+    equivalencia a 1e-4: dos caminos que salen del encoder a 1e-6 uno del otro (SDPA
+    y cuBLAS eligen otro kernel segun B y mascara) quedan redondeados a resolucion
+    TF32 por las convoluciones del decoder. Medido en una RTX 3060 sobre el
+    aislamiento del notebook 12 SS6: 6.9e-04 con TF32, 1.3e-06 sin -- el mismo orden
+    que MPS, que no tiene TF32.
+
+    Usa la API legacy `allow_tf32` a proposito: en torch 2.12 setear solo la nueva
+    (`cudnn.conv.fp32_precision`) deja conv y RNN distintas y cualquier lectura
+    posterior de `allow_tf32` levanta RuntimeError. Solo toca los flags que estaban
+    prendidos. Fuera de CUDA no tiene efecto."""
+    tb = torch.backends
+    conv, matmul = tb.cudnn.allow_tf32, tb.cuda.matmul.allow_tf32
+    if conv:
+        tb.cudnn.allow_tf32 = False
+    if matmul:
+        tb.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        if conv:
+            tb.cudnn.allow_tf32 = True
+        if matmul:
+            tb.cuda.matmul.allow_tf32 = True
 
 
 # alias historico: el notebook lo usaba antes de que el codigo fuera portable

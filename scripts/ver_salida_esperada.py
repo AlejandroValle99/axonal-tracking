@@ -50,6 +50,8 @@ from matplotlib.colors import ListedColormap
 RAIZ = Path(__file__).resolve().parents[1]
 sys.path.append(str(RAIZ / "src"))
 
+# el umbral de movil de los targets, que es el del harness (antes una copia local de 4.0)
+from axonal_tracking.datos_pixel import MIN_DESPLAZAMIENTO_PX
 from axonal_tracking.etiquetas_deteccion import (
     ids_que_se_mueven,
     mascara_traza,
@@ -59,7 +61,6 @@ from axonal_tracking.parametros import PIXEL_SIZE_UM
 DATASETS = RAIZ / "datasets"
 SALIDA = RAIZ / "results" / "kymorope"
 POR_DEFECTO = ("test", "sample_00099")
-MIN_DESPLAZAMIENTO_PX = 4.0  # mismo umbral de "movil" que usa el resto del repo
 
 FONDO = "#0b0b10"
 COLOR_ESTATICA = "#4a5568"

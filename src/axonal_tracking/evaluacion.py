@@ -32,20 +32,29 @@ import pandas as pd
 __all__ = [
     "AREA_FRAC_DEGENERADA",
     "IOU_AMBIGUO",
+    "LIMITE_ANGULO_ESTATICO_GRADOS",
     "MIN_OVERLAP_FILAS",
     "THR_PX_TRACK",
+    "angulo_inclinacion_grados",
+    "cargar_escena_sintetica",
+    "clasificar_por_angulo",
     "emparejar_con_gt",
     "emparejar_greedy",
+    "es_movil_polilinea",
     "evaluar_mascara",
     "evaluar_trayectorias",
     "evaluar_trayectorias_polilineas",
     "extraer_subpixel",
     "flaggear_cruces",
     "flaggear_cruces_gt",
+    "ids_moviles_por_angulo",
     "iou_caja",
     "iou_mascara",
     "nearest_particle_per_row",
+    "resumen_fragmentacion",
     "resumen_identidad",
+    "resumen_por_cruce",
+    "resumen_por_estrato",
     "velocidad_px_frame",
 ]
 
@@ -419,3 +428,168 @@ def evaluar_trayectorias_polilineas(
         "frac_id_switch": round(float(tr.id_switch.mean()), 3) if len(tr) else np.nan,
     }
     return tr, resumen
+
+
+# --------------------------------------------------------------------------- #
+# Piezas compartidas por los scripts de evaluacion (KymoButler, KymoRoPE)
+# --------------------------------------------------------------------------- #
+# Estaban dentro de `scripts/evaluar_kymobutler_400.py`. Se mudan aca, sin cambiar la
+# logica, para que la evaluacion de KymoRoPE las use sin importar ese script: el script
+# importa `kymobutler` a nivel de modulo, y la ruta de KymoRoPE tiene que correr sin el
+# (Colab, `docs/kymorope-handover.md` SS1). El script conserva `cargar_escena` y
+# `es_movil` como envoltorios finos porque varios scripts y NB11 los importan de ahi.
+def cargar_escena_sintetica(sample_dir) -> dict:
+    """Una muestra sintetica -> el dict que espera `evaluar_trayectorias_polilineas`:
+    kimografo CRUDO (el que usa `extraer_subpixel` para el centroide), `positions.csv`
+    completo, y `pixel_scale_um`/`fps` de su `config.yaml`."""
+    from pathlib import Path
+
+    import tifffile
+    import yaml
+
+    sample_dir = Path(sample_dir)
+    kymo = tifffile.imread(sample_dir / "kymograph.tif")
+    if kymo.ndim == 3:
+        kymo = kymo[..., 0]
+    cfg = yaml.safe_load((sample_dir / "config.yaml").read_text())
+    return {
+        "nombre": sample_dir.name,
+        "kymo": kymo,
+        "positions": pd.read_csv(sample_dir / "positions.csv"),
+        "pixel_scale_um": float(cfg["general"]["pixel_scale_um"]),
+        "fps": float(cfg["general"]["fps"]),
+    }
+
+
+def es_movil_polilinea(poli: pd.DataFrame, min_desplazamiento_px: float) -> bool:
+    """Filtro de clase `movil` del lado de la PREDICCION: mismo criterio que
+    `ed.ids_que_se_mueven` usa del lado del GT (rango total de columna >= umbral).
+    Sin esto, un metodo que emite tracks de estaticas o de casi-moviles pierde
+    precision contra un GT que solo tiene moviles."""
+    c = poli["col_subpixel"].to_numpy()
+    return bool(len(c) and (c.max() - c.min()) >= min_desplazamiento_px)
+
+
+def resumen_fragmentacion(tr: pd.DataFrame) -> dict:
+    """`fragmentos_por_gt` (polilineas por particula GT recuperada) y
+    `frac_gt_fragmentado` (fraccion de GT recuperadas en mas de una polilinea), sobre
+    la tabla por-polilinea de `evaluar_trayectorias_polilineas`."""
+    matched = tr[tr.gt_id != -1] if len(tr) else tr
+    if not len(matched):
+        return {"fragmentos_por_gt": np.nan, "frac_gt_fragmentado": np.nan}
+    frag = matched.groupby(["muestra", "gt_id"]).size()
+    return {
+        "fragmentos_por_gt": round(float(frag.mean()), 3),
+        "frac_gt_fragmentado": round(float((frag > 1).mean()), 3),
+    }
+
+
+def resumen_por_estrato(
+    escenas: dict[str, dict],
+    estrato_por_muestra: dict[str, str],
+    *,
+    min_desplazamiento_px: float,
+    polilineas_key: str = "polilineas",
+) -> pd.DataFrame:
+    """Corre `evaluar_trayectorias_polilineas` por estrato de MUESTRA (p.ej. terciles de
+    aspect ratio, barra 5 del gate) y devuelve una fila por estrato. Re-corre el harness
+    sobre cada subconjunto en vez de recalcular desde la tabla, para que cada cifra salga
+    por exactamente la misma logica que el resumen global."""
+    filas = []
+    for estrato in sorted(set(estrato_por_muestra.values())):
+        sub = {n: e for n, e in escenas.items() if estrato_por_muestra.get(n) == estrato}
+        if not sub:
+            continue
+        tr, res = evaluar_trayectorias_polilineas(
+            sub, min_desplazamiento_px=min_desplazamiento_px, polilineas_key=polilineas_key
+        )
+        filas.append({"estrato": estrato, "n_muestras": len(sub), **res,
+                      **resumen_fragmentacion(tr)})
+    return pd.DataFrame(filas)
+
+
+def resumen_por_cruce(tr: pd.DataFrame, ambiguos_por_muestra: dict[str, set[int]]) -> pd.DataFrame:
+    """Parte la tabla por-polilinea segun si su particula GT dominante cruza a otra movil
+    (`flaggear_cruces_gt`) o no. Es donde la identidad se decide: una particula que
+    nunca toca a otra no puede sufrir un id-switch por cruce. Las polilineas sin GT
+    (`gt_id == -1`) no se pueden clasificar y quedan afuera."""
+    if not len(tr):
+        return pd.DataFrame()
+    matched = tr[tr.gt_id != -1].copy()
+    matched["cruce"] = [
+        int(g) in ambiguos_por_muestra.get(m, set())
+        for m, g in zip(matched.muestra, matched.gt_id)
+    ]
+    filas = []
+    for cruce, sub in matched.groupby("cruce"):
+        filas.append({
+            "grupo": "con cruce" if cruce else "sin cruce",
+            "n_polilineas": len(sub),
+            "n_gt": sub.groupby(["muestra", "gt_id"]).ngroups,
+            "frac_id_switch": round(float(sub.id_switch.mean()), 3),
+            **resumen_fragmentacion(sub),
+            "err_pos_um_medio": round(float(sub.err_um.mean()), 3),
+        })
+    return pd.DataFrame(filas)
+
+
+# --------------------------------------------------------------------------- #
+# Clasificacion estatica / movil del LABORATORIO (angulo de inclinacion)
+# --------------------------------------------------------------------------- #
+# La regla con la que el laboratorio clasifica cada particula en sus planillas: estatica
+# si |atan(pendiente NETA en px/frame)| < 2 grados ("Static angle limit = 2", seccion
+# "Particle analysis settings", igual en las 8 planillas). Verificada contra
+# kymos110925-WT.xlsx: reproduce la clase del laboratorio en 311/311 particulas; el
+# angulo calza en px/frame (en um/s queda a 27 grados). No depende de segundos por frame.
+#
+# NO es el umbral del harness (`ed.MIN_DESPLAZAMIENTO_PX_MOVIL`, rango >= 8 px) ni el de
+# los targets de KymoRoPE (el mismo 8 px): el harness define que trayectorias hay que
+# encontrar para comparar metodos, y esta regla dice como las llamaria el laboratorio. Se
+# aplica DESPUES del decode, por trayectoria. En val las dos definiciones de GT difieren
+# en 1.7% de las particulas: 149 con rango >= 8 px y angulo < 2 grados (moviles lentas en
+# videos largos) y 43 al reves (videos cortos).
+LIMITE_ANGULO_ESTATICO_GRADOS = 2.0
+
+
+def angulo_inclinacion_grados(frames, cols) -> float:
+    """Angulo de la pendiente NETA de una trayectoria, en grados: atan((x_fin - x_ini) /
+    (t_fin - t_ini)) con x en px y t en frames. Neta, no ajustada: una particula que va y
+    vuelve tiene pendiente neta casi nula aunque se haya movido mucho (misma definicion
+    que el `Inclination angle` de las planillas; si se usa ajuste o neta en la
+    herramienta del laboratorio sigue abierto, `docs/dataset-findings.md` Q13a)."""
+    f = np.asarray(frames, dtype=float)
+    x = np.asarray(cols, dtype=float)
+    if len(f) < 2:
+        return 0.0
+    orden = np.argsort(f, kind="stable")
+    f, x = f[orden], x[orden]
+    dt = f[-1] - f[0]
+    return float(np.degrees(np.arctan((x[-1] - x[0]) / dt))) if dt > 0 else 0.0
+
+
+def clasificar_por_angulo(
+    poli: pd.DataFrame, limite_grados: float = LIMITE_ANGULO_ESTATICO_GRADOS
+) -> str:
+    """"movil" o "estatica" para una polilinea `(frame, col_subpixel)` con la regla del
+    laboratorio. Para aplicar sobre la salida de un decode o de KymoButler."""
+    angulo = angulo_inclinacion_grados(poli["frame"], poli["col_subpixel"])
+    return "movil" if abs(angulo) >= limite_grados else "estatica"
+
+
+def ids_moviles_por_angulo(
+    positions: pd.DataFrame,
+    pixel_scale_um: float,
+    limite_grados: float = LIMITE_ANGULO_ESTATICO_GRADOS,
+) -> set[int]:
+    """Lado GT de `clasificar_por_angulo`: `particle_id`s moviles por la regla del
+    laboratorio, con la pendiente neta entre el primer y el ultimo frame VISIBLE. En val
+    da 2160 moviles (contra 2266 del harness a 8 px)."""
+    moviles = set()
+    for pid, sub in positions.groupby("particle_id"):
+        v = sub[sub["visible"].astype(bool)] if "visible" in sub.columns else sub
+        if len(v) < 2:
+            continue
+        angulo = angulo_inclinacion_grados(v["frame"], v["pos_um"].to_numpy() / pixel_scale_um)
+        if abs(angulo) >= limite_grados:
+            moviles.add(int(pid))
+    return moviles

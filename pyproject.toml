@@ -34,6 +34,14 @@ dev = [
 [tool.uv.sources]
 kymobutler = { path = "../KymoButler", editable = true }
 synthkymo = { path = "../ingenia-kymograph", editable = true }
+# Los wheels de torch en PyPI para Windows son solo CPU; se toman del índice de PyTorch con CUDA.
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [dependency-groups]
 dev = [

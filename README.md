@@ -22,6 +22,7 @@ This repository collects experiments across several evaluation branches:
 | **Transformers over raw video** | Segmentation with SAM2 / SAM3 guided by detectors (blob_log, Grounding DINO) directly on the VSI stack | Prototypes (NB02, NB04) |
 | **SAM3 for axon ROI detection** | Temporal max-projection of synthetic video + SAM3 to automatically detect the axon ROI, compared against GT | Active (NB03) |
 | **Transformers over kymographs** | Detect-then-segment (YOLO+SAM3, NB07–09), Mask2Former segmentation (NB10), and segment-level association via attention (NB11) — all measured against KymoButler on the same 400-sample synthetic split | Closed, negative result (NB07–11; see `plan/notebooks-08-09-closeout.md`, `docs/revision-rumbo-vit.md`, `plan/notebook11-closeout.md`) |
+| **KymoRoPE (per-pixel transformer)** | ViT encoder with RoPE in physical units (s, µm) over the kymograph at native resolution; per-pixel trackness, instance-embedding and orientation heads, decoded into trajectories and measured against KymoButler with the same harness | Active (NB12–13) |
 | **KymoButler baseline** | U-Net + classical tracker (Jakobs, Franze & Bhatt 2019, *eLife*) over kymographs | Baseline (NB06) |
 | **Synthetic kymographs** | Generation of kymographs with exact ground truth to validate trackers at progressive difficulty | Active (NB05) |
 | **Classical preprocessing** | VSI/ETS reading, background subtraction, kymograph extraction | Support (NB01) |
@@ -50,6 +51,10 @@ notebooks/   Experiments, one per approach/stage
   11_asociacion_atencion.ipynb  Classical cost + global attention over KymoButler's own segments,
                                 replacing DecNet's greedy-local association — frozen, negative-result
                                 baseline (see plan/notebook11-closeout.md)
+  12_kymorope.ipynb             KymoRoPE: per-pixel transformer with physical-unit RoPE at native
+                                resolution — build, verify, train, pixel-level inspection
+  13_kymorope_decode.ipynb      KymoRoPE decode to trajectories, compared against GT and KymoButler
+                                on val (scripts/evaluar_kymorope.py, scripts/evaluar_kymobutler_400.py)
 src/axonal_tracking/   Support modules reused by the notebooks
   ets_reader.py, preprocesamiento.py, kimografo.py,
   kimografo_sintetico.py, configuracion.py, visualizacion.py, ...

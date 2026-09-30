@@ -39,7 +39,11 @@ import torch
 import yaml
 from torch.utils.data import Dataset
 
-from axonal_tracking.etiquetas_deteccion import ids_que_se_mueven, mascara_traza
+from axonal_tracking.etiquetas_deteccion import (
+    MIN_DESPLAZAMIENTO_PX_MOVIL,
+    ids_que_se_mueven,
+    mascara_traza,
+)
 from axonal_tracking.parametros import PIXEL_SIZE_UM
 
 __all__ = [
@@ -53,8 +57,24 @@ __all__ = [
     "normalizar_kymografo",
 ]
 
-MIN_DESPLAZAMIENTO_PX = 4.0  # mismo umbral de "movil" que el resto del repo
+# Umbral de "movil" de los TARGETS de KymoRoPE: el MISMO que el harness de trayectorias y
+# todos los pipelines anteriores (`ed.MIN_DESPLAZAMIENTO_PX_MOVIL`), importado y no copiado
+# para que no vuelvan a divergir. El modelo aprende exactamente la definicion con la que
+# se lo evalua.
+#
+# Historia: desde el 2026-09-22 valia 4.0 por un desliz (con un comentario que decia
+# "mismo umbral que el resto del repo"), y el checkpoint `kymorope_40ep_2026-09-24.pt`
+# se entreno asi. Alineado a 8.0 el 2026-09-27. No se uso la regla del laboratorio
+# (angulo de inclinacion < 2 grados = estatica) para los targets: en val llamaria estaticas
+# a 149 particulas (6.6%) que el harness cuenta como moviles, y el modelo perderia recall
+# contra su propio benchmark. La regla del laboratorio se aplica DESPUES del decode, por
+# trayectoria (`evaluacion.clasificar_por_angulo`).
+MIN_DESPLAZAMIENTO_PX = MIN_DESPLAZAMIENTO_PX_MOVIL
 PERCENTILES_CONTRASTE = (50.0, 99.8)  # mismo criterio que preprocesamiento.frame_a_rgb_uint8
+# Formato del cache de disco. Entra en el nombre de su carpeta (`_firma_cache`): cambiarlo,
+# o cambiar el umbral de movil o la escala de pixel, apunta a una carpeta nueva y el cache
+# se reconstruye solo en vez de servir targets viejos en silencio.
+VERSION_CACHE = 2
 
 # Clases del head de trackness (SS2.5)
 CLASE_FONDO, CLASE_ESTATICA, CLASE_MOVIL = 0, 1, 2
@@ -197,7 +217,14 @@ class DatasetKymografos(Dataset):
 
     `cache_targets=True` guarda los targets construidos en memoria; con 800 muestras
     de ~220x1300 son ~2 GB, asi que por defecto se reconstruyen (el costo dominante
-    es `mascara_traza`, ~30 particulas por muestra)."""
+    es `mascara_traza`, ~30 particulas por muestra).
+
+    `cache_dir` es la carpeta BASE del cache de disco. Dos protecciones contra servir
+    targets viejos: la subcarpeta `_firma_cache()` codifica version de formato, umbral de
+    movil y escala de pixel (cambiar cualquiera apunta a otra carpeta), y cada archivo
+    lleva en el nombre la huella de SUS archivos fuente (`_huella_fuente`), asi que una
+    muestra cambiada -- o una de otro dataset con el mismo `sample_NNNNN` -- no reusa una
+    entrada ajena. Agregar muestras al dataset solo construye las nuevas."""
 
     def __init__(
         self,
@@ -207,22 +234,57 @@ class DatasetKymografos(Dataset):
         min_desplazamiento_px: float = MIN_DESPLAZAMIENTO_PX,
         fps_permitidos: set[float] | None = None,
         limite: int | None = None,
+        subconjunto: int | None = None,
         cache_targets: bool = False,
         cache_dir: Path | str | None = None,
     ):
         self.raiz = Path(raiz_split)
-        self.cache_dir = Path(cache_dir) if cache_dir else None
         self.pixel_scale_um = pixel_scale_um
         self.min_desplazamiento_px = min_desplazamiento_px
+        self.cache_dir = Path(cache_dir) / self._firma_cache() if cache_dir else None
         self.cache_targets = cache_targets
         self._cache: dict[int, MuestraPixel] = {}
+        self._rutas: dict[int, Path] = {}
 
         dirs = sorted(d for d in self.raiz.glob("sample_*") if (d / "kymograph.tif").exists())
         if fps_permitidos is not None:
             dirs = [d for d in dirs if self._leer_fps(d) in fps_permitidos]
+        if subconjunto is not None and limite is not None:
+            raise ValueError("`limite` (las primeras N) y `subconjunto` (N al azar) se excluyen")
+        if subconjunto is not None:
+            dirs = self._subconjunto_anidado(dirs, subconjunto)
         self.dirs = dirs[:limite] if limite else dirs
         if not self.dirs:
             raise FileNotFoundError(f"Sin muestras en {self.raiz} (fps_permitidos={fps_permitidos})")
+
+    def _firma_cache(self) -> str:
+        """Subcarpeta del cache: `v2_mov8px_esc0.107`. Lo que cambia TODOS los targets a
+        la vez; lo que cambia una muestra va en el nombre de su archivo."""
+        return f"v{VERSION_CACHE}_mov{self.min_desplazamiento_px:g}px_esc{self.pixel_scale_um:g}"
+
+    def _subconjunto_anidado(self, dirs: list[Path], n: int) -> list[Path]:
+        """`n` muestras representativas y ANIDADAS, para la curva de escala de datos.
+
+        Por que no las primeras `n` (`limite`): el `manifest.csv` del dataset de 33k esta
+        ordenado por perfil de generador, y las primeras 5000 son 90% WT, 100 de cada uno
+        de otros cinco perfiles y ninguna de los perfiles `*_movers` (los de mas moviles y
+        cruces, justo lo que le falta aprender al embedding).
+
+        Orden: primero las muestras originales del split (`manifest.orig.csv`, las 800 con
+        las que se entreno el checkpoint del 2026-09-24), despues el resto en una
+        permutacion con semilla fija. Tomar las primeras `n` de ese orden da subconjuntos
+        anidados (800 c 5000 c 10000 c ...) con los perfiles en proporcion, asi cada punto
+        de la curva agrega datos sin cambiar los que ya estaban. Devuelve la seleccion
+        ordenada por nombre."""
+        originales: set[str] = set()
+        orig = self.raiz / "manifest.orig.csv"
+        if orig.exists():
+            originales = set(pd.read_csv(orig, usecols=["sample_dir"]).sample_dir)
+        primero = [d for d in dirs if d.name in originales]
+        resto = [d for d in dirs if d.name not in originales]
+        orden_resto = np.random.default_rng(0).permutation(len(resto))
+        elegidos = (primero + [resto[i] for i in orden_resto])[:n]
+        return sorted(elegidos)
 
     @staticmethod
     def _leer_fps(dir_muestra: Path) -> float:
@@ -235,7 +297,18 @@ class DatasetKymografos(Dataset):
         return [self._leer_fps(d) for d in self.dirs]
 
     def formas(self) -> list[tuple[int, int]]:
-        """`(T, L)` de cada muestra sin cargar los pixeles -- lo usa el bucketing."""
+        """`(T, L)` de cada muestra sin cargar los pixeles -- lo usa el bucketing.
+
+        Si el split trae `manifest.csv` con `n_frames`/`kymograph_width`, sale de ahi:
+        abrir 30 000 cabeceras TIFF tarda del orden de un minuto por llamada. Se usa el
+        manifest solo si cubre TODAS las muestras; si no, se leen las cabeceras."""
+        manifest = self.raiz / "manifest.csv"
+        if manifest.exists():
+            m = pd.read_csv(manifest)
+            if {"sample_dir", "n_frames", "kymograph_width"} <= set(m.columns):
+                por_dir = dict(zip(m.sample_dir, zip(m.n_frames, m.kymograph_width)))
+                if all(d.name in por_dir for d in self.dirs):
+                    return [(int(por_dir[d.name][0]), int(por_dir[d.name][1])) for d in self.dirs]
         import tifffile
 
         return [tuple(tifffile.TiffFile(d / "kymograph.tif").pages[0].shape[:2]) for d in self.dirs]
@@ -244,43 +317,46 @@ class DatasetKymografos(Dataset):
         return len(self.dirs)
 
     def _ruta_cache(self, i: int) -> Path | None:
-        return None if self.cache_dir is None else self.cache_dir / f"{self.dirs[i].name}.npz"
+        if self.cache_dir is None:
+            return None
+        if i not in self._rutas:
+            d = self.dirs[i]
+            self._rutas[i] = self.cache_dir / f"{d.name}_{_huella_fuente(d)}.npz"
+        return self._rutas[i]
 
     def _construir(self, i: int) -> dict:
         """Arrays de una muestra: lo caro (rasterizar + dilatar ~30 trazas, ~0.064 s)
         y lo unico que vale la pena cachear a disco."""
-        import tifffile
+        return _arrays_muestra(self.dirs[i], self.pixel_scale_um, self.min_desplazamiento_px)
 
-        d = self.dirs[i]
-        kymo = normalizar_kymografo(tifffile.imread(d / "kymograph.tif"))
-        tg = construir_targets(
-            pd.read_csv(d / "positions.csv"),
-            kymo.shape,
-            pixel_scale_um=self.pixel_scale_um,
-            min_desplazamiento_px=self.min_desplazamiento_px,
-        )
-        return {
-            "kymo": kymo,
-            "trackness": tg.trackness,
-            "instancias": tg.instancias,
-            "theta": tg.theta,
-            "mask_pull": tg.mask_pull,
-            "mask_theta": tg.mask_theta,
-            "n_instancias": np.int32(tg.n_instancias),
-            "dt_segundos": np.float32(1.0 / self._leer_fps(d)),
-        }
-
-    def precalcular(self, verboso: bool = True) -> None:
+    def precalcular(self, verboso: bool = True, procesos: int = 1) -> None:
         """Llena el cache de disco de una. Sin esto la primera epoca paga el costo
-        (y con `num_workers>0` lo pagan los workers, en paralelo pero igual)."""
+        (y con `num_workers>0` lo pagan los workers, en paralelo pero igual).
+
+        `procesos > 1` reparte las muestras entre procesos: con 30 000 muestras a ~0.06 s
+        de CPU cada una, en serie son ~30 min. En Windows los procesos arrancan con
+        `spawn`, asi que llamarlo desde un script exige el guardia `__main__`
+        (`scripts/precalcular_cache_kymorope.py` lo tiene)."""
         if self.cache_dir is None:
             raise ValueError("precalcular() necesita cache_dir")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         faltan = [i for i in range(len(self)) if not self._ruta_cache(i).exists()]
-        for k, i in enumerate(faltan):
-            np.savez(self._ruta_cache(i), **self._construir(i))
-            if verboso and (k + 1) % 100 == 0:
-                print(f"  cache {k + 1}/{len(faltan)}")
+        tareas = [
+            (self.dirs[i], self._ruta_cache(i), self.pixel_scale_um, self.min_desplazamiento_px)
+            for i in faltan
+        ]
+        if procesos > 1 and len(tareas) > 1:
+            from concurrent.futures import ProcessPoolExecutor
+
+            with ProcessPoolExecutor(procesos) as ex:
+                for k, _ in enumerate(ex.map(_construir_y_guardar, tareas, chunksize=16)):
+                    if verboso and (k + 1) % 500 == 0:
+                        print(f"  cache {k + 1}/{len(tareas)}", flush=True)
+        else:
+            for k, tarea in enumerate(tareas):
+                _construir_y_guardar(tarea)
+                if verboso and (k + 1) % 100 == 0:
+                    print(f"  cache {k + 1}/{len(tareas)}", flush=True)
         if verboso:
             print(f"cache listo: {len(self)} muestras en {self.cache_dir}")
 
@@ -296,10 +372,9 @@ class DatasetKymografos(Dataset):
         else:
             a = self._construir(i)
             if ruta is not None:
-                ruta.parent.mkdir(parents=True, exist_ok=True)
-                np.savez(ruta, **a)
+                _guardar_cache(ruta, a)
 
-        kymo = a["kymo"]
+        kymo = a["kymo"].astype(np.float32)  # en cache va en float16
         tg = TargetsPixel(
             trackness=a["trackness"], instancias=a["instancias"], theta=a["theta"],
             mask_pull=a["mask_pull"], mask_theta=a["mask_theta"],
@@ -325,6 +400,73 @@ class DatasetKymografos(Dataset):
         if self.cache_targets:
             self._cache[i] = muestra
         return muestra
+
+
+def _huella_fuente(dir_muestra: Path) -> str:
+    """Huella de los archivos de los que salen los targets de una muestra: tamano y fecha
+    de modificacion de `kymograph.tif`, `positions.csv` y `config.yaml` (de ahi sale el
+    fps). Son tres `stat`, no una lectura: con 33 000 muestras se calcula en segundos.
+    Mover la carpeta del dataset dentro del mismo disco conserva las fechas y reusa el
+    cache; regenerar o reemplazar una muestra lo invalida."""
+    import hashlib
+
+    partes = []
+    for nombre in ("kymograph.tif", "positions.csv", "config.yaml"):
+        s = (dir_muestra / nombre).stat()
+        partes.append(f"{s.st_size}-{s.st_mtime_ns}")
+    return hashlib.sha1("|".join(partes).encode()).hexdigest()[:10]
+
+
+def _arrays_muestra(dir_muestra: Path, pixel_scale_um: float, min_desplazamiento_px: float) -> dict:
+    """Kimografo normalizado + targets de una muestra, como arrays. A nivel de modulo (no
+    metodo) para que `ProcessPoolExecutor` lo pueda serializar."""
+    import tifffile
+
+    kymo = normalizar_kymografo(tifffile.imread(dir_muestra / "kymograph.tif"))
+    tg = construir_targets(
+        pd.read_csv(dir_muestra / "positions.csv"),
+        kymo.shape,
+        pixel_scale_um=pixel_scale_um,
+        min_desplazamiento_px=min_desplazamiento_px,
+    )
+    return {
+        "kymo": kymo,
+        "trackness": tg.trackness,
+        "instancias": tg.instancias,
+        "theta": tg.theta,
+        "mask_pull": tg.mask_pull,
+        "mask_theta": tg.mask_theta,
+        "n_instancias": np.int32(tg.n_instancias),
+        "dt_segundos": np.float32(1.0 / DatasetKymografos._leer_fps(dir_muestra)),
+    }
+
+
+def _guardar_cache(ruta: Path, arrays: dict) -> None:
+    """Formato v2 del cache: comprimido, kimografo y theta en float16.
+
+    v1 guardaba sin comprimir y en float32: ~16 B/px, ~144 GB proyectados para 30 000
+    muestras. Las mascaras son casi todo ceros y comprimen muy bien; el kimografo ya esta
+    normalizado a [0, 1], donde float16 (paso ~5e-4) sobra -- el modelo lo recibe en bf16
+    bajo autocast igual. `theta` es seno/coseno y el modelo ya lo usaba en float16.
+
+    Escribe a un temporal y renombra: si el proceso muere a mitad de camino no queda un
+    `.npz` truncado que `ruta.exists()` tome por valido."""
+    import os
+
+    datos = dict(arrays)
+    datos["kymo"] = np.asarray(datos["kymo"], dtype=np.float16)
+    datos["theta"] = np.asarray(datos["theta"], dtype=np.float16)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    temporal = ruta.with_name(f"{ruta.stem}.{os.getpid()}.tmp")
+    with open(temporal, "wb") as f:
+        np.savez_compressed(f, **datos)
+    os.replace(temporal, ruta)
+
+
+def _construir_y_guardar(tarea: tuple) -> None:
+    """Unidad de trabajo de `precalcular` (serializable para procesos)."""
+    dir_muestra, ruta, pixel_scale_um, min_desplazamiento_px = tarea
+    _guardar_cache(ruta, _arrays_muestra(dir_muestra, pixel_scale_um, min_desplazamiento_px))
 
 
 @dataclass

@@ -59,6 +59,8 @@ Numbered notebooks form the experimental pipeline, in rough dependency order:
 | `09_segmentacion_transformer.ipynb` | SAM3 turns YOLO's boxes into a per-track mask (Stage 2 of detect-then-segment) | Baseline (negative result, frozen) |
 | `10_mask2former_kymografo.ipynb` | Mask2Former segmentation on (synthetic) kymographs, vs KymoButler | Baseline (negative result, frozen) |
 | `11_asociacion_atencion.ipynb` | Classical cost + global attention over KymoButler's own segments, replacing DecNet's greedy-local association | Baseline (negative result, frozen) |
+| `12_kymorope.ipynb` | KymoRoPE: per-pixel transformer (physical-unit RoPE, native resolution) — build, verify, train, pixel-level inspection | Active |
+| `13_kymorope_decode.ipynb` | KymoRoPE decode (per-pixel maps → trajectories) vs GT and KymoButler on val; reads `scripts/evaluar_kymorope.py` / `evaluar_kymobutler_400.py --split val` outputs | Active |
 
 Notebooks 07–09 implement the "detect-then-segment" architecture described in
 `plan/detection-segmentation-guide.md` (YOLO detector → SAM3 segmenter), which maps to
@@ -113,6 +115,24 @@ moved before). When adding a new approach, follow the `NN_descripcion.ipynb` con
   (p50-p99.8).
 - `etiquetas_deteccion.py` — exports detection/segmentation labels from synthetic synthkymo datasets
   to train the YOLO detector and/or SAM3 segmenter (notebooks 07-09's data layer).
+- `evaluacion.py` — the shared trajectory harness (`evaluar_trayectorias_polilineas`) every
+  pipeline is measured with, plus `extraer_subpixel` (the repo's only centroid) and the shared
+  scene loader / mobility filter / fragmentation and stratified summaries.
+- KymoRoPE (notebooks 12–13): `kymorope.py` (model + device-agnostic helpers), `datos_pixel.py`
+  (per-pixel targets + disk cache), `entrenamiento.py` (adapter over `notebooks/trainer.py`),
+  `decodificacion.py` (per-pixel maps → trajectory polylines for the harness). The KymoRoPE path
+  must not import `kymobutler` (it has to run on Colab without the sibling repo).
+  "Mobile" means total position range ≥ 8 px everywhere (targets import the harness's
+  `ed.MIN_DESPLAZAMIENTO_PX_MOVIL`; until 2026-09-27 the targets used 4 px by mistake, and the
+  checkpoint `kymorope_40ep_2026-09-24.pt` was trained that way). The lab's own static/mobile rule
+  is a 2° inclination angle; it is applied *after* decoding, per trajectory
+  (`evaluacion.clasificar_por_angulo`), not used as a training label.
+  Data: `datasets/train` holds 33,000 samples (14 generator profiles; the original 800 are
+  `manifest.orig.csv` and are backed up in `datasets/train_800_viejo/`). Use
+  `subconjunto_train=N` (representative, nested, includes the 800) — not `limite_train`, whose
+  first N are almost all one profile. Train via NB12 `entrenar("run_name", ...)`: from scratch,
+  fine-tune (`pesos_iniciales=`) or resume (`reanudar=True`, same arguments); each run has its own
+  `results/kymorope/checkpoints/<run>/`.
 
 ### `config.yaml` — synthetic kymograph generation parameters
 

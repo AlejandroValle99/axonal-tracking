@@ -28,11 +28,13 @@ falle fuerte a que un `EarlyStopping` mal cableado parezca funcionar.
 """
 from __future__ import annotations
 
+import os
 import sys
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
 
@@ -72,10 +74,17 @@ class MuestreadorPorTokens(Sampler):
     """`batch_sampler` que agrupa indices por CONTEO DE TOKENS (SS2.3).
 
     Re-agrupa en cada `__iter__` con una semilla distinta, llevando el contador de
-    epoca adentro: un `set_epoch()` externo se olvida, un contador interno no. El
-    bucketing en si es determinista (ordenar por costo y cortar), lo que cambia de
-    epoca a epoca es el ORDEN de los lotes, asi que `__len__` es estable y el
-    scheduler puede dimensionarse de antemano."""
+    epoca adentro: un `set_epoch()` externo se olvida, un contador interno no. Todo es
+    determinista dado `(semilla, epoca)`, asi que el plan completo de lotes -- y con el
+    la cantidad de pasos del scheduler -- se puede calcular de antemano
+    (`pasos_totales`), y reanudar en la epoca `e` reproduce exactamente la epoca `e`.
+
+    `muestras_por_epoca`: con 30 000 muestras una epoca completa son ~45 min en la 3060.
+    Si se fija, cada "epoca" toma el siguiente tramo de ese tamano de una permutacion del
+    dataset (una permutacion nueva por vuelta completa, todas con semilla), asi que cada
+    muestra se ve una vez por vuelta pero hay checkpoint y validacion cada tramo. Sin
+    fijarlo (default) el comportamiento es el de siempre: todas las muestras por epoca,
+    mismo orden de lotes que antes de existir el parametro."""
 
     def __init__(
         self,
@@ -85,32 +94,72 @@ class MuestreadorPorTokens(Sampler):
         max_tokens: int = MAX_TOKENS_LOTE,
         max_muestras: int = MAX_MUESTRAS_LOTE,
         semilla: int = 0,
+        muestras_por_epoca: int | None = None,
     ):
         self.formas = formas
         self.patch = patch
         self.max_tokens = max_tokens
         self.max_muestras = max_muestras
         self.semilla = semilla
+        n = len(formas)
+        self.muestras_por_epoca = (
+            muestras_por_epoca if muestras_por_epoca and muestras_por_epoca < n else None
+        )
         self._epoca = 0
-        self._n_lotes = len(self._agrupar(barajar=False))
+        self._lotes_cache: dict[int, list[list[int]]] = {}
+        self._permutaciones: dict[int, np.ndarray] = {}
 
-    def _agrupar(self, *, barajar: bool) -> list[list[int]]:
-        return agrupar_por_tokens(
-            self.formas,
+    def _indices_epoca(self, epoca: int) -> np.ndarray:
+        n = len(self.formas)
+        if self.muestras_por_epoca is None:
+            return np.arange(n)
+        k = self.muestras_por_epoca
+        ini = epoca * k
+        partes, pos = [], ini
+        while pos < ini + k:  # el tramo puede cruzar de una vuelta a la siguiente
+            vuelta, desde = divmod(pos, n)
+            if vuelta not in self._permutaciones:
+                gen = np.random.default_rng(self.semilla + 1_000_003 * (vuelta + 1))
+                self._permutaciones[vuelta] = gen.permutation(n)
+            toma = min(ini + k - pos, n - desde)
+            partes.append(self._permutaciones[vuelta][desde:desde + toma])
+            pos += toma
+        return np.concatenate(partes)
+
+    def _calcular_lotes(self, epoca: int) -> list[list[int]]:
+        idx = self._indices_epoca(epoca)
+        lotes = agrupar_por_tokens(
+            [self.formas[i] for i in idx],
             patch=self.patch,
             max_tokens=self.max_tokens,
             max_muestras=self.max_muestras,
-            barajar=barajar,
-            semilla=self.semilla + self._epoca,
+            barajar=True,
+            semilla=self.semilla + epoca,
+        )
+        return [[int(idx[j]) for j in lote] for lote in lotes]
+
+    def lotes_de_epoca(self, epoca: int) -> list[list[int]]:
+        """Lotes (indices del dataset) de la epoca `epoca`, deterministas."""
+        if epoca not in self._lotes_cache:
+            self._lotes_cache[epoca] = self._calcular_lotes(epoca)
+        return self._lotes_cache[epoca]
+
+    def pasos_totales(self, epocas: int, gradient_accumulation_steps: int) -> int:
+        """Pasos de optimizador de `epocas` epocas, exactos: `train_model_v2` da un paso
+        cada `gradient_accumulation_steps` lotes mas uno final si sobran. Calcula sin
+        guardar los planes (30k muestras x 40 epocas serian ~40 MB de listas)."""
+        return sum(
+            -(-len(self._calcular_lotes(e)) // gradient_accumulation_steps) for e in range(epocas)
         )
 
     def __iter__(self):
-        lotes = self._agrupar(barajar=True)
+        lotes = self.lotes_de_epoca(self._epoca)
+        self._lotes_cache.pop(self._epoca - 1, None)  # no acumular planes viejos
         self._epoca += 1
         yield from lotes
 
     def __len__(self) -> int:
-        return self._n_lotes
+        return len(self.lotes_de_epoca(self._epoca))
 
 
 class TrainerKymoRoPE(Trainer):
@@ -149,6 +198,10 @@ class TrainerKymoRoPE(Trainer):
         )
         self.lambdas = lambdas or {}
         self.desglose: dict[str, list[float]] = defaultdict(list)
+        # Los fija `construir_entrenador`: el muestreador (cuantas epocas van completas) y
+        # los argumentos que definen el plan de pasos del scheduler (ver `cargar_checkpoint`)
+        self.muestreador: MuestreadorPorTokens | None = None
+        self.plan: dict = {}
 
     # -- utilidades ------------------------------------------------------- #
     def _mover(self, lote: LoteEmpaquetado) -> list:
@@ -209,21 +262,60 @@ class TrainerKymoRoPE(Trainer):
     def compute_eval_loss(self, batch):
         return self._perdida_lote(self._mover(batch), use_amp=False, dtype=torch.float32)["total"]
 
+    def save_checkpoint(self, step: int, final: bool = False):
+        """`Trainer.save_checkpoint` + lo que hace falta para reanudar.
+
+        `Trainer` guarda solo `step`, que `train_model_v2` reinicia en cada epoca: el
+        checkpoint de la corrida de 40 epocas del 2026-09-24 dice `step=153` (lotes de la
+        ULTIMA epoca) con el scheduler en 3080/3080. Reanudar desde ahi no sabia en que
+        epoca estaba y rearmaba 40 epocas encima de un OneCycle terminado, que levanta
+        error en el primer paso. Aca se guardan ademas `epocas_completas` (se llama al
+        final de `train_model_v2`, con la epoca ya entrenada) y el `plan`."""
+        os.makedirs(self.save_dir, exist_ok=True)
+        sufijo = "final" if final else f"step_{step}"
+        torch.save(
+            {
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scaler_state_dict": self.scaler.state_dict() if self.scaler is not None else None,
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "step": step,
+                "epocas_completas": self.muestreador._epoca if self.muestreador else None,
+                "plan": self.plan,
+            },
+            os.path.join(self.save_dir, f"checkpoint_{sufijo}.pt"),
+        )
+
     def cargar_checkpoint(self, ruta: str | Path, *, estricto: bool = True) -> int:
-        """Restaura modelo, optimizador, scheduler y scaler. Devuelve el `step`.
+        """Restaura modelo, optimizador, scheduler, scaler y la epoca del muestreador.
+        Devuelve cuantas epocas completas trae el checkpoint.
 
-        `Trainer.save_checkpoint` escribia sin que nadie leyera: una corrida cortada
-        (limite de sesion en Colab, kernel reiniciado, corte de luz) se perdia
-        entera. Con esto se reanuda desde el ultimo `checkpoint_final.pt`.
+        Solo reanuda una corrida con el MISMO plan (epocas, muestras por epoca, tope de
+        tokens, acumulacion, semilla, cantidad de muestras, lr): el estado del OneCycle
+        que se carga fue dimensionado para ese plan, y con otro quedaria desfasado o se
+        pasaria de su total. Un checkpoint anterior a este cambio no trae
+        `epocas_completas` y no se puede reanudar: para arrancar de sus pesos esta
+        `construir_entrenador(pesos_iniciales=...)`, que es un fine-tune.
 
-        `estricto=False` tolera que no calce el estado del optimizador -- util para
-        arrancar de los pesos de otra corrida sin heredar su momento."""
+        `estricto=False` tolera que no calce el estado del optimizador."""
         ruta = Path(ruta)
         if not ruta.exists():
             raise FileNotFoundError(f"No existe el checkpoint {ruta}")
         # `weights_only=False`: el checkpoint trae estados de optimizador/scheduler,
         # no solo tensores. Es un archivo propio, no de terceros.
         ck = torch.load(ruta, map_location=self.device, weights_only=False)
+        if ck.get("epocas_completas") is None:
+            raise ValueError(
+                f"{ruta} no guarda `epocas_completas` (checkpoint anterior al 2026-09-27): "
+                "reanudarlo desfasaria el scheduler. Para arrancar de sus pesos, usar "
+                "`construir_entrenador(pesos_iniciales=...)`."
+            )
+        if ck.get("plan") and self.plan and ck["plan"] != self.plan:
+            raise ValueError(
+                f"El checkpoint es de otro plan de entrenamiento:\n  checkpoint {ck['plan']}\n"
+                f"  esta corrida {self.plan}\nReanudar con los mismos argumentos, o usar "
+                "`pesos_iniciales` para un fine-tune nuevo desde esos pesos."
+            )
         self.model.load_state_dict(ck["model_state_dict"])
         if ck.get("optimizer_state_dict") is not None:
             try:
@@ -235,7 +327,10 @@ class TrainerKymoRoPE(Trainer):
             self.scheduler.load_state_dict(ck["scheduler_state_dict"])
         if ck.get("scaler_state_dict") is not None and self.scaler is not None:
             self.scaler.load_state_dict(ck["scaler_state_dict"])
-        return int(ck.get("step", 0))
+        epocas = int(ck["epocas_completas"])
+        if self.muestreador is not None:
+            self.muestreador._epoca = epocas  # la proxima epoca reproduce el plan original
+        return epocas
 
     def desglose_medio(self) -> dict[str, float]:
         """Media del desglose acumulado y reinicio del acumulador. Se mira por
@@ -273,6 +368,7 @@ def construir_entrenador(
     max_tokens: int = MAX_TOKENS_LOTE,
     fps_excluido: float | None = None,
     limite_train: int | None = None,
+    subconjunto_train: int | None = None,
     limite_val: int | None = None,
     num_workers: int | None = None,
     contexto_mp: str | None = None,
@@ -281,12 +377,40 @@ def construir_entrenador(
     save_dir: Path | str | None = None,
     usar_checkpoint: bool | None = None,
     reanudar: bool | str | Path = False,
+    pesos_iniciales: str | Path | None = None,
+    muestras_por_epoca: int | None = None,
+    procesos_cache: int = 1,
+    semilla: int = 0,
 ) -> tuple[TrainerKymoRoPE, dict]:
     """Arma datasets, samplers, modelo, optimizador, scheduler y el `Trainer`.
 
     `fps_excluido` implementa el ablation de SS5.3: saca una tasa de muestreo del
     train y la deja en val/test. Es un filtro sobre el `Dataset`, sin regenerar nada
     -- las cinco tasas estan en los tres splits.
+
+    **Tres formas de arrancar** (y `info["epoca_inicial"]` dice desde que epoca seguir):
+
+    - de cero (default);
+    - `pesos_iniciales=ruta.pt`: **fine-tune**. Carga SOLO los pesos del modelo de otra
+      corrida; optimizador y scheduler arrancan nuevos, dimensionados para esta. Es lo
+      que corresponde para seguir entrenando el checkpoint del 2026-09-24 sobre el
+      dataset de 30k (con un `lr` mas bajo que el de un entrenamiento de cero);
+    - `reanudar=True` (o una ruta): **continuar una corrida cortada** con los mismos
+      argumentos. Restaura todo, incluida la epoca del muestreador, y se niega si el
+      checkpoint es de otro plan (`TrainerKymoRoPE.cargar_checkpoint`).
+
+    `subconjunto_train=N` entrena sobre N muestras representativas y anidadas del train
+    (`DatasetKymografos._subconjunto_anidado`: siempre incluyen las 800 originales, y el
+    de 5000 esta contenido en el de 10000). Es para la curva de escala de datos; NO usar
+    `limite_train` para eso, que toma las primeras N y en el dataset de 33k son casi todas
+    de un solo perfil.
+
+    `muestras_por_epoca`: epocas cortas sobre datasets grandes (ver
+    `MuestreadorPorTokens`); con 30k muestras, p.ej. 5000 da checkpoint y validacion cada
+    ~7 min en vez de cada ~45. Es otra cosa que `subconjunto_train`: recorre TODO el train,
+    de a tramos. `procesos_cache` paraleliza el precalculo del cache si
+    falta (en Windows desde un notebook funciona porque la tarea vive en un modulo;
+    para 30k conviene correr antes `scripts/precalcular_cache_kymorope.py`).
 
     **Parche del stem** (`kymorope.PARCHE`, hoy 32): con el presupuesto de pixeles
     igualado, el parche 32 gana en las dos cosas contra el 16 -- 2.45 GB contra 3.78 y
@@ -347,16 +471,19 @@ def construir_entrenador(
 
     train = DatasetKymografos(
         raiz / "train", fps_permitidos=fps_train, limite=limite_train,
-        cache_dir=cache_raiz / "train",
+        subconjunto=subconjunto_train, cache_dir=cache_raiz / "train",
     )
     val = DatasetKymografos(raiz / "val", limite=limite_val, cache_dir=cache_raiz / "val")
     for nombre, d in (("train", train), ("val", val)):
         faltan = sum(1 for i in range(len(d)) if not d._ruta_cache(i).exists())
         if faltan:
             print(f"precalculando cache de {nombre}: {faltan} muestras...")
-            d.precalcular(verboso=False)
+            d.precalcular(verboso=False, procesos=procesos_cache)
 
-    sampler_train = MuestreadorPorTokens(train.formas(), max_tokens=max_tokens)
+    sampler_train = MuestreadorPorTokens(
+        train.formas(), max_tokens=max_tokens, semilla=semilla,
+        muestras_por_epoca=muestras_por_epoca,
+    )
     sampler_val = MuestreadorPorTokens(val.formas(), max_tokens=max_tokens)
     # `num_workers>0` es lo que despega la GPU: construir los targets de una muestra
     # cuesta ~0.064 s de CPU (rasterizar + dilatar ~30 trazas), o sea ~0.45 s por
@@ -394,9 +521,11 @@ def construir_entrenador(
 
     modelo = KymoRoPE(usar_checkpoint=usar_checkpoint).to(dev)
     opt = torch.optim.AdamW(modelo.parameters(), lr=lr, weight_decay=weight_decay)
-    # el scheduler avanza una vez por PASO DE OPTIMIZADOR, no por micro-batch
-    pasos_por_epoca = -(-len(sampler_train) // gradient_accumulation_steps)
-    total_steps = max(epocas * pasos_por_epoca, 1)
+    # el scheduler avanza una vez por PASO DE OPTIMIZADOR, no por micro-batch. El total
+    # sale del plan exacto del muestreador: con `muestras_por_epoca` cada epoca tiene una
+    # cantidad de lotes distinta, y un OneCycle que se queda corto levanta error.
+    pasos_por_epoca = -(-len(sampler_train) // gradient_accumulation_steps)  # la primera
+    total_steps = max(sampler_train.pasos_totales(epocas, gradient_accumulation_steps), 1)
     # `OneCycleLR` divide por el largo de cada fase: con `pct_start*total_steps < 2`
     # la fase de calentamiento queda de largo 0 y `get_lr()` levanta
     # ZeroDivisionError. Pasa facil en corridas cortas (`limite_train`, smoke tests),
@@ -421,30 +550,46 @@ def construir_entrenador(
         gradient_accumulation_steps=gradient_accumulation_steps,
         save_dir=save_dir or (_RAIZ / "results" / "kymorope" / "checkpoints"),
     )
-    paso_inicial = 0
+    entrenador.muestreador = sampler_train
+    entrenador.plan = {
+        "epocas": epocas, "muestras_por_epoca": sampler_train.muestras_por_epoca,
+        "max_tokens": max_tokens, "gradient_accumulation_steps": gradient_accumulation_steps,
+        "semilla": semilla, "n_train": len(train), "lr": lr,
+        "subconjunto_train": subconjunto_train, "limite_train": limite_train,
+    }
+
+    epoca_inicial = 0
     if reanudar:
         base = Path(save_dir or (_RAIZ / "results" / "kymorope" / "checkpoints"))
         ruta = base / "checkpoint_final.pt" if reanudar is True else Path(reanudar)
         if ruta.exists():
-            paso_inicial = entrenador.cargar_checkpoint(ruta)
-            print(f"reanudado desde {ruta} (step {paso_inicial})")
+            epoca_inicial = entrenador.cargar_checkpoint(ruta)
+            print(f"reanudado desde {ruta}: {epoca_inicial} de {epocas} epocas completas")
         else:
             print(f"reanudar activo pero no hay checkpoint en {ruta}: se arranca de cero")
+    if pesos_iniciales and epoca_inicial == 0:
+        ck = torch.load(pesos_iniciales, map_location=dev, weights_only=False)
+        modelo.load_state_dict(ck["model_state_dict"])
+        print(f"fine-tune: pesos iniciales de {pesos_iniciales} (optimizador y scheduler nuevos)")
 
     info = {
         "dispositivo": str(dev),
-        "paso_inicial": paso_inicial,
+        "epoca_inicial": epoca_inicial,
+        "pesos_iniciales": str(pesos_iniciales) if pesos_iniciales and epoca_inicial == 0 else None,
         "n_train": len(train),
+        "subconjunto_train": subconjunto_train,
         "n_val": len(val),
-        "fps_train": sorted(set(train.fps())),
+        # leer el config.yaml de cada muestra solo para informar: con 30k son ~1 min
+        "fps_train": sorted(set(train.fps())) if len(train) <= 5000 else "(no leido: >5000 muestras)",
         "fps_excluido": fps_excluido,
+        "muestras_por_epoca": sampler_train.muestras_por_epoca or len(train),
         "lotes_por_epoca": len(sampler_train),
         "pasos_optimizador_por_epoca": pasos_por_epoca,
         "total_steps_scheduler": total_steps,
         "scheduler": nombre_sched,
         "usar_checkpoint": modelo.usar_checkpoint,
         "num_workers": num_workers,
-        "cache_dir": str(cache_raiz),
+        "cache_dir": str(train.cache_dir),
         "parametros": sum(p.numel() for p in modelo.parameters()),
     }
     return entrenador, info
