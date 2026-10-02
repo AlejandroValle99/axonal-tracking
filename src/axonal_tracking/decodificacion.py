@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy.ndimage import label
+from scipy.signal import find_peaks
 
 from axonal_tracking import evaluacion as ev
 from axonal_tracking.etiquetas_deteccion import MIN_DESPLAZAMIENTO_PX_MOVIL
@@ -53,12 +54,14 @@ __all__ = [
     "cortar_en_cadenas",
     "decodificar",
     "mapas_desde_salida",
+    "suavizar_polilinea",
 ]
 
 _VECINDAD_8 = np.ones((3, 3), dtype=int)
 # ver `cortar_en_cadenas`: con max_hueco_filas <= 2 el tope no cambia nada
 _TOPE_CRECIMIENTO_FILAS = 3
 _MIN_FILAS_FRAGMENTO = 3  # con enlace activo, fragmentos mas cortos no se consideran
+_PROMINENCIA_MIN_PICO = 0.15  # fraccion del rango de intensidad de la corrida (`_centros_por_pico`)
 _FILAS_PENDIENTE = 5  # filas del final de un fragmento para estimar su pendiente
 
 
@@ -85,10 +88,26 @@ class ParametrosDecode:
     margen_enlace: float = 0.25  # costo minimo entre el mejor candidato y el segundo
     max_dist_emb_denso: float = 0.75  # umbral de embedding si otra trayectoria cruza el hueco
     radio_denso_px: float = 10.0  # "cruza el hueco" = pasa a menos de esto del tramo enlazado
-    # posicion de fila desde la corrida completa de la mascara (ver `_centros_desde_mascara`);
-    # False = centro de los pixeles del cluster, como antes
+    # Posicion de cada fila, tres modos:
+    # - `centro_desde_mascara` (default): centro geometrico de la corrida completa de la
+    #   mascara; donde la corrida es compartida, el de los pixeles propios;
+    # - los dos en False: centro de los pixeles del cluster (primera version). En val da
+    #   exactamente lo mismo que el default;
+    # - `centro_por_pico`: pico de intensidad del kimografo (`_centros_por_pico`).
+    #   **Apagado: resultado negativo** (val, 2026-09-29). Sin guardas subio el id-switch
+    #   de 0.094 a 0.153; con guardas empeoro la posicion (0.047 -> 0.049 um, y con
+    #   trackness e identidad GT 0.034 -> 0.040): en kimografos reales el pixel mas
+    #   brillante de UNA fila ruidosa es peor estimador que el centro de la mascara, que
+    #   promedia sobre el ancho de la traza. Queda para no repetir la prueba.
+    centro_por_pico: bool = False
+    max_desplazamiento_pico_px: float = 3.0
     centro_desde_mascara: bool = True
-    min_filas: int = 10  # igual a `min_frames` de KymoButler
+    # Suavizado temporal de la posicion a lo largo de cada trayectoria (`suavizar_polilinea`):
+    # None (default), "mediana", "media" o "sg" (Savitzky-Golay cuadratico), con ventana en
+    # filas. Se elige en val.
+    suavizado: str | None = None
+    ventana_suavizado: int = 5
+    min_filas: int = 10  # igual a `min_frames` de KymoButler; el punto de operacion usa 30
     min_desplazamiento_px: float = MIN_DESPLAZAMIENTO_PX_MOVIL  # filtro del harness
 
 
@@ -359,7 +378,7 @@ def decodificar(
     # dueno de cada pixel movil (1..n, 0 = ninguno): para saber si la corrida completa de
     # una fila es de una sola trayectoria o la comparte con otra en un cruce
     propietario = None
-    if params.centro_desde_mascara:
+    if params.centro_desde_mascara or params.centro_por_pico:
         propietario = np.zeros((alto, ancho), np.int32)
         for j, (fc, cc) in enumerate(fragmentos, 1):
             propietario[fc, cc] = j
@@ -369,14 +388,56 @@ def decodificar(
             continue
         poli = _polilinea_subpixel(
             fc, cc, kymo_crudo,
-            mascara=movil if params.centro_desde_mascara else None,
+            mascara=movil if (params.centro_desde_mascara or params.centro_por_pico) else None,
             propietario=propietario, propio=j,
+            por_pico=params.centro_por_pico,
+            max_desplazamiento_pico_px=params.max_desplazamiento_pico_px,
         )
+        if params.suavizado:
+            poli = suavizar_polilinea(poli, params.suavizado, params.ventana_suavizado)
         if len(poli) and ev.es_movil_polilinea(poli, params.min_desplazamiento_px):
             polilineas.append(poli)
             if instancias is not None:
                 instancias[fc, cc] = len(polilineas)
     return (polilineas, instancias) if devolver_instancias else polilineas
+
+
+def suavizar_polilinea(poli: pd.DataFrame, metodo: str, ventana: int = 5) -> pd.DataFrame:
+    """Suavizado temporal de `col_subpixel` a lo largo de una trayectoria.
+
+    La posicion de cada fila sale de UNA fila ruidosa, pero el transporte axonal se mueve en
+    corridas de velocidad casi constante y pausas: entre filas vecinas la posicion cambia
+    poco y de forma regular, asi que promediar a lo largo del tiempo baja el ruido por fila
+    sin depender de la geometria de la mascara ni de un pico de intensidad.
+
+    Se suaviza por TRAMO de frames consecutivos (una trayectoria enlazada a traves de una
+    pausa tiene huecos: no se promedia a traves de ellos); tramos mas cortos que la ventana
+    quedan como estan. `metodo`: "mediana" (conserva escalones), "media" (redondea las
+    esquinas corrida/pausa) o "sg" (Savitzky-Golay cuadratico: conserva tramos lineales y
+    curvas suaves)."""
+    from scipy.ndimage import median_filter, uniform_filter1d
+    from scipy.signal import savgol_filter
+
+    if len(poli) < ventana or ventana < 2:
+        return poli
+    orden = np.argsort(poli["frame"].to_numpy(), kind="stable")
+    fr = poli["frame"].to_numpy()[orden]
+    x = poli["col_subpixel"].to_numpy(dtype=float)[orden]
+    salida = x.copy()
+    cortes = np.flatnonzero(np.diff(fr) != 1) + 1
+    for ini, fin in zip(np.r_[0, cortes], np.r_[cortes, len(fr)]):
+        tramo = x[ini:fin]
+        if len(tramo) < ventana:
+            continue
+        if metodo == "mediana":
+            salida[ini:fin] = median_filter(tramo, size=ventana, mode="nearest")
+        elif metodo == "media":
+            salida[ini:fin] = uniform_filter1d(tramo, size=ventana, mode="nearest")
+        elif metodo == "sg":
+            salida[ini:fin] = savgol_filter(tramo, ventana if ventana % 2 else ventana + 1, 2, mode="interp")
+        else:
+            raise ValueError(f"suavizado desconocido: {metodo!r}")
+    return pd.DataFrame({"frame": fr, "col_subpixel": salida})
 
 
 def _centros_por_fila(filas: np.ndarray, cols: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -544,6 +605,8 @@ def _polilinea_subpixel(
     mascara: np.ndarray | None = None,
     propietario: np.ndarray | None = None,
     propio: int = 0,
+    por_pico: bool = False,
+    max_desplazamiento_pico_px: float = 3.0,
 ) -> pd.DataFrame:
     """Cadena -> linea central de 1 px -> `extraer_subpixel`.
 
@@ -555,15 +618,110 @@ def _polilinea_subpixel(
     variante `solo_moviles_subpixel` de KymoButler (rasterizar fino -> `extraer_subpixel`),
     asi que el error de posicion es comparable entre metodos.
 
-    Con `mascara`, el centro de cada fila sale de la corrida completa de la mascara movil
-    (`_centros_desde_mascara`); sin ella, de los pixeles de la cadena."""
+    Con `mascara` y `por_pico`, el centro de cada fila es el pico de intensidad propio
+    (`_centros_por_pico`); con `mascara` sola, el centro de la corrida completa de la
+    mascara movil (`_centros_desde_mascara`); sin ella, el de los pixeles de la cadena."""
     alto, ancho = kymo_crudo.shape[:2]
     unicas, centro = _centros_por_fila(filas, cols)
-    if mascara is not None and propietario is not None:
+    if mascara is not None and por_pico and propietario is not None:
+        centro = _centros_por_pico(
+            filas, cols, unicas, centro, mascara, kymo_crudo,
+            propietario, propio, max_desplazamiento_pico_px,
+        )
+    elif mascara is not None and propietario is not None:
         centro = _centros_desde_mascara(filas, cols, unicas, centro, mascara, propietario, propio)
     fina = np.zeros((alto, ancho), dtype=bool)
     fina[unicas, np.clip(np.round(centro).astype(int), 0, ancho - 1)] = True
     return ev.extraer_subpixel(fina, kymo_crudo)
+
+
+def _centros_por_pico(
+    filas: np.ndarray,
+    cols: np.ndarray,
+    unicas: np.ndarray,
+    centro: np.ndarray,
+    mascara: np.ndarray,
+    kymo_crudo: np.ndarray,
+    propietario: np.ndarray,
+    propio: int,
+    max_desplazamiento_px: float,
+) -> np.ndarray:
+    """Centro de cada fila en el PICO de intensidad de la particula, no en la geometria de
+    la mascara. El cluster decide de quien es la fila; la posicion la da el kimografo.
+
+    **Solo donde es seguro** (si no, queda el centro de los pixeles propios):
+
+    - la corrida de mascara no tiene pixeles de OTRA trayectoria (`propietario`), y los
+      pixeles propios caen en una sola corrida;
+    - el pico mueve la posicion a lo sumo `max_desplazamiento_px`.
+
+    Motivo de las dos guardas, medido en val el 2026-09-29: la primera version (pico en
+    toda fila) bajo el error de posicion del modelo afinado de 0.047 a 0.042 um pero subio
+    el id-switch de 0.094 a 0.153, y con trackness e identidad GT (D0) de 0.028 a 0.153 --
+    o sea, lo causaba el decode. Con dos particulas a pocos pixeles sus perfiles se funden
+    en UN pico; las dos trayectorias saltaban a el, y como queda mas cerca de una de las
+    dos particulas, el harness asignaba las filas de la otra a la particula equivocada.
+
+    Por fila: la ventana es la corrida de mascara movil que contiene los pixeles propios
+    (extendida por los dos lados mientras siga habiendo mascara); el perfil de intensidad
+    se suaviza con [1, 2, 1]/4, y se toma el maximo local mas cercano al centro de los
+    pixeles propios. `extraer_subpixel` refina despues +/- 2 px alrededor de ese pico.
+
+    Motivo, medido en val con el modelo afinado sobre 5k (diagnostico por fila del
+    2026-09-29): en filas sin ninguna otra movil a menos de 20 px -- el 84% de las filas --
+    el error era 18% mayor que el de KymoButler, y con la mascara GT (D0) era igual al de
+    KymoButler. O sea: la extraccion anda bien, lo que falla es que el centro geometrico
+    de la mascara PREDICHA no cae en el centro de la traza. Cerca de otra movil el error
+    se iba HACIA AFUERA (el cluster vecino se queda con los pixeles del medio y los propios
+    quedan de un solo lado). El pico de intensidad no depende de ninguna de las dos cosas;
+    es lo que sigue el esqueleto de KymoButler (una cresta de la salida de la U-Net).
+
+    Lo que la guarda deja afuera son justamente las filas de cruce, que siguen con el error
+    de antes; el pico arregla las filas aisladas (84% de las filas, donde el modelo afinado
+    tenia 18% mas error que KymoButler porque el centro de la mascara PREDICHA no cae en el
+    centro de la traza)."""
+    orden = np.argsort(filas, kind="stable")
+    f, c = filas[orden], cols[orden]
+    ini = np.searchsorted(f, unicas)
+    fin = np.searchsorted(f, unicas, side="right")
+    ancho = mascara.shape[1]
+    kymo2d = kymo_crudo if kymo_crudo.ndim == 2 else kymo_crudo[..., 0]
+    salida = centro.copy()
+    for i, r in enumerate(unicas):
+        propias = c[ini[i]:fin[i]]
+        a, b = int(propias.min()), int(propias.max())
+        fila_mascara = mascara[r]
+        if not fila_mascara[a:b + 1].all():
+            continue  # pixeles propios en mas de una corrida (astillas de un cruce)
+        while a > 0 and fila_mascara[a - 1]:
+            a -= 1
+        while b < ancho - 1 and fila_mascara[b + 1]:
+            b += 1
+        duenos = propietario[r, a:b + 1]
+        if np.any((duenos != 0) & (duenos != propio)):
+            continue  # corrida compartida con otra trayectoria
+        perfil = kymo2d[r, a:b + 1].astype(float)
+        if len(perfil) >= 3:
+            perfil = np.convolve(np.pad(perfil, 1, mode="edge"), [0.25, 0.5, 0.25], mode="valid")
+        bajo, alto = float(perfil.min()), float(perfil.max())
+        if alto <= bajo:
+            continue
+        # Solo maximos PROMINENTES: el ruido de fondo deja maximitos locales en las colas,
+        # y el mas cercano a los pixeles propios puede ser uno de esos (visto en la prueba
+        # de juguete: particula en 20.0 -> 17.6). Prominencia relativa y no un umbral de
+        # altura: una particula tenue al lado de una brillante conserva su prominencia
+        # contra el valle que las separa. Los extremos se rellenan con el minimo para que
+        # un pico en el borde de la corrida tambien cuente.
+        picos, _ = find_peaks(
+            np.r_[bajo, perfil, bajo], prominence=_PROMINENCIA_MIN_PICO * (alto - bajo)
+        )
+        if len(picos) == 0:
+            continue
+        picos = picos - 1  # por el relleno
+        pico = a + picos[np.argmin(np.abs(a + picos - centro[i]))]
+        if abs(pico - centro[i]) <= max_desplazamiento_px:
+            salida[i] = pico
+    return salida
 
 
 def _centros_desde_mascara(

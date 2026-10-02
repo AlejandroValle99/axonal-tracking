@@ -56,11 +56,18 @@ TOLERANCIA_F1 = 0.01  # regla del punto de operacion (ver docstring)
 def grilla() -> dict[str, tuple[str, dc.ParametrosDecode]]:
     """nombre de fila -> (fuente de los mapas, parametros del decode).
 
-    Historia de la grilla, primera corrida completa en val (decode que CORTABA ante
-    ambiguedad, `cortar_en_cadenas` previo): h=0.5 sobresegmentaba (3.0-3.6 fragmentos por
-    GT); el enlace solo geometrico (sin embedding) disparaba el id-switch a 0.17-0.19, asi
-    que el enlace va siempre con identidad. Esas filas se sacaron."""
-    base = dc.ParametrosDecode(ancho_banda=1.5)
+    Base de todas las filas (punto de operacion elegido en val el 2026-09-29): largo minimo
+    30 filas y suavizado Savitzky-Golay de 7 filas. Las ablaciones de abajo apagan de a una
+    las piezas del decode que se agregaron despues de la primera corrida.
+
+    Historia (lo que ya se midio y se saco de la grilla): h=0.5 sobresegmentaba (3.0-3.6
+    fragmentos por GT); el enlace solo geometrico disparaba el id-switch a 0.17-0.19 (el
+    enlace va siempre con identidad); el `margen_enlace` de 0.5 y los modos de centro
+    `centro_desde_mascara` / pixeles del cluster daban identico; el centro por pico de
+    intensidad fue negativo (ver `decodificacion.ParametrosDecode.centro_por_pico`)."""
+    base = dc.ParametrosDecode(
+        ancho_banda=1.5, min_filas=30, suavizado="sg", ventana_suavizado=7
+    )
     enlace = replace(base, max_hueco_enlace=40)
     filas = {
         "D0_gt_oraculo": ("gt_oraculo", base),
@@ -74,21 +81,26 @@ def grilla() -> dict[str, tuple[str, dc.ParametrosDecode]]:
         # enlace de fragmentos entre componentes: las pausas que el head de trackness
         # marca estaticas parten la traza en componentes distintas
         filas[f"M2_h{h:g}_w0_enlace40"] = ("modelo", replace(enlace, ancho_banda=h))
-    filas["M2_h1.5_w0_enlace40_margen0.5"] = ("modelo", replace(enlace, margen_enlace=0.5))
     filas["M2_h1.5_w1"] = ("modelo", replace(base, peso_orientacion=1.0))
 
-    # Ablaciones del punto de operacion anterior (M2_h1.5_w0_enlace40, corrida del
-    # 2026-09-24), apagando de a una las dos mejoras del decode que se agregaron despues:
-    # posicion desde la corrida completa de la mascara, y enlace estricto en zonas densas.
-    # `_antes` apaga las dos y tiene que reproducir esa corrida (F1 0.977, id-switch 0.116,
-    # 1.336 trayectorias por particula, 0.049 um): si no, el refactor cambio algo mas.
+    # Ablaciones del punto de operacion (M2_h1.5_w0_enlace40), de a una pieza:
+    # - `_sin_suavizado`: sin Savitzky-Golay. Offline sobre val, SG-7 bajo el error de
+    #   posicion del modelo afinado de 0.041 a 0.038 um sin tocar F1/id-switch/fragmentos
+    #   (a KymoButler le hace lo mismo: 0.032 -> 0.029; la brecha no se cierra);
+    # - `_min10` / `_min20`: largo minimo de antes (= `min_frames` de KymoButler) e
+    #   intermedio. Con 30, 1.283 -> 1.175 trayectorias por particula y la posicion baja,
+    #   porque el harness promedia POR trayectoria y las astillas pesaban como una traza;
+    # - `_enlace_laxo`: sin el enlace estricto en zonas densas;
+    # - `_antes`: todo apagado; tiene que reproducir la corrida del modelo afinado del
+    #   2026-09-29 (0.981 / 0.100 / 1.267 / 0.048 um).
     laxo = {"margen_enlace": 0.0, "max_dist_emb_denso": enlace.max_dist_emb_enlace}
-    filas["M2_h1.5_w0_enlace40_centro_cluster"] = (
-        "modelo", replace(enlace, centro_desde_mascara=False)
-    )
+    filas["M2_h1.5_w0_enlace40_sin_suavizado"] = ("modelo", replace(enlace, suavizado=None))
+    for minimo in (10, 20):
+        filas[f"M2_h1.5_w0_enlace40_min{minimo}"] = ("modelo", replace(enlace, min_filas=minimo))
     filas["M2_h1.5_w0_enlace40_enlace_laxo"] = ("modelo", replace(enlace, **laxo))
     filas["M2_h1.5_w0_enlace40_antes"] = (
-        "modelo", replace(enlace, centro_desde_mascara=False, **laxo)
+        "modelo",
+        replace(enlace, min_filas=10, suavizado=None, centro_desde_mascara=False, **laxo),
     )
     return filas
 
