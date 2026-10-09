@@ -162,14 +162,17 @@ def main(split: str, checkpoint: Path, limite: int | None, prefijos: list[str] |
     modelo = kr.KymoRoPE().to(dev).eval()
     modelo.load_state_dict(ck["model_state_dict"])
     cache = RAIZ / "results" / "kymorope" / "cache" / split
+    # la normalizacion de entrada es parte del modelo: sale del checkpoint, no es un argumento
+    modo = dp.modo_de_checkpoint(ck)
     ds = dp.DatasetKymografos(
-        RAIZ / "datasets" / split, limite=limite, cache_dir=cache if cache.exists() else None
+        RAIZ / "datasets" / split, limite=limite, cache_dir=cache if cache.exists() else None,
+        modo_normalizacion=modo,
     )
     filas = grilla()
     if prefijos:
         filas = {k: v for k, v in filas.items() if any(k.startswith(p) for p in prefijos)}
-    print(f"{len(ds)} muestras de {split} · {len(filas)} filas de decode · {dev} · {checkpoint.name}",
-          flush=True)
+    print(f"{len(ds)} muestras de {split} · {len(filas)} filas de decode · {dev} · {checkpoint.name}"
+          f" · normalizacion {modo}", flush=True)
 
     escenas: dict[str, dict] = {nombre: {} for nombre in filas}
     segundos = defaultdict(float)
@@ -207,6 +210,7 @@ def main(split: str, checkpoint: Path, limite: int | None, prefijos: list[str] |
     elegido = punto_de_operacion(resumenes)
     (salida_dir / "resumen.json").write_text(json.dumps({
         "split": split, "n_muestras": len(ds), "checkpoint": str(checkpoint),
+        "modo_normalizacion": modo,
         "min_desplazamiento_px": MIN_DESPLAZAMIENTO_PX_MOVIL, "thr_px_track": ev.THR_PX_TRACK,
         "punto_de_operacion": elegido,
         "regla": f"min frac_id_switch + frac_gt_fragmentado con track_f1 >= mejor M2 - {TOLERANCIA_F1}",

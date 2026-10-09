@@ -133,6 +133,13 @@ moved before). When adding a new approach, follow the `NN_descripcion.ipynb` con
   first N are almost all one profile. Train via NB12 `entrenar("run_name", ...)`: from scratch,
   fine-tune (`pesos_iniciales=`) or resume (`reanudar=True`, same arguments); each run has its own
   `results/kymorope/checkpoints/<run>/`.
+  Input normalization is part of the model: `modo_normalizacion` is `"p50_clip"` (the default,
+  used by every checkpoint up to 2026-10-08) or `"p50"` (same stretch without the clip, which
+  zeroes faint tracks in regions darker than the image median; `plan/kymorope-preprocessing.md`).
+  It is saved in the checkpoint's `plan`, and inference must take it from there
+  (`datos_pixel.modo_de_checkpoint`), never as a free argument. The disk cache holds targets
+  only; the kymograph is read raw from its tif and normalized at load, so one cache serves
+  every mode.
 
 ### `config.yaml` — synthetic kymograph generation parameters
 

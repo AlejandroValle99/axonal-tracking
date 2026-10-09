@@ -39,10 +39,12 @@ import torch
 from torch.utils.data import DataLoader, Sampler
 
 from axonal_tracking.datos_pixel import (
+    MODO_NORMALIZACION_DEFAULT,
     DatasetKymografos,
     LoteEmpaquetado,
     agrupar_por_tokens,
     collate_empaquetado,
+    modo_de_checkpoint,
 )
 from axonal_tracking.kymorope import PARCHE, KymoRoPE, memoria_total, perdida_total
 
@@ -310,9 +312,11 @@ class TrainerKymoRoPE(Trainer):
                 "reanudarlo desfasaria el scheduler. Para arrancar de sus pesos, usar "
                 "`construir_entrenador(pesos_iniciales=...)`."
             )
-        if ck.get("plan") and self.plan and ck["plan"] != self.plan:
+        # los planes anteriores al 2026-10-08 no traen el modo: eran todos "p50_clip"
+        plan_ck = {"modo_normalizacion": modo_de_checkpoint(ck), **(ck.get("plan") or {})}
+        if ck.get("plan") and self.plan and plan_ck != self.plan:
             raise ValueError(
-                f"El checkpoint es de otro plan de entrenamiento:\n  checkpoint {ck['plan']}\n"
+                f"El checkpoint es de otro plan de entrenamiento:\n  checkpoint {plan_ck}\n"
                 f"  esta corrida {self.plan}\nReanudar con los mismos argumentos, o usar "
                 "`pesos_iniciales` para un fine-tune nuevo desde esos pesos."
             )
@@ -381,6 +385,7 @@ def construir_entrenador(
     muestras_por_epoca: int | None = None,
     procesos_cache: int = 1,
     semilla: int = 0,
+    modo_normalizacion: str = MODO_NORMALIZACION_DEFAULT,
 ) -> tuple[TrainerKymoRoPE, dict]:
     """Arma datasets, samplers, modelo, optimizador, scheduler y el `Trainer`.
 
@@ -404,6 +409,12 @@ def construir_entrenador(
     de 5000 esta contenido en el de 10000). Es para la curva de escala de datos; NO usar
     `limite_train` para eso, que toma las primeras N y en el dataset de 33k son casi todas
     de un solo perfil.
+
+    `modo_normalizacion` es la normalizacion de entrada (`datos_pixel.MODOS_NORMALIZACION`,
+    `plan/kymorope-preprocessing.md`). Queda en el `plan` del checkpoint y la inferencia la
+    lee de ahi (`datos_pixel.modo_de_checkpoint`). Un fine-tune desde pesos entrenados con
+    otro modo es valido (los pesos se adaptan a la entrada nueva) y se avisa; una
+    reanudacion con otro modo, no.
 
     `muestras_por_epoca`: epocas cortas sobre datasets grandes (ver
     `MuestreadorPorTokens`); con 30k muestras, p.ej. 5000 da checkpoint y validacion cada
@@ -472,8 +483,12 @@ def construir_entrenador(
     train = DatasetKymografos(
         raiz / "train", fps_permitidos=fps_train, limite=limite_train,
         subconjunto=subconjunto_train, cache_dir=cache_raiz / "train",
+        modo_normalizacion=modo_normalizacion,
     )
-    val = DatasetKymografos(raiz / "val", limite=limite_val, cache_dir=cache_raiz / "val")
+    val = DatasetKymografos(
+        raiz / "val", limite=limite_val, cache_dir=cache_raiz / "val",
+        modo_normalizacion=modo_normalizacion,
+    )
     for nombre, d in (("train", train), ("val", val)):
         faltan = sum(1 for i in range(len(d)) if not d._ruta_cache(i).exists())
         if faltan:
@@ -556,6 +571,7 @@ def construir_entrenador(
         "max_tokens": max_tokens, "gradient_accumulation_steps": gradient_accumulation_steps,
         "semilla": semilla, "n_train": len(train), "lr": lr,
         "subconjunto_train": subconjunto_train, "limite_train": limite_train,
+        "modo_normalizacion": modo_normalizacion,
     }
 
     epoca_inicial = 0
@@ -571,6 +587,9 @@ def construir_entrenador(
         ck = torch.load(pesos_iniciales, map_location=dev, weights_only=False)
         modelo.load_state_dict(ck["model_state_dict"])
         print(f"fine-tune: pesos iniciales de {pesos_iniciales} (optimizador y scheduler nuevos)")
+        if modo_de_checkpoint(ck) != modo_normalizacion:
+            print(f"  esos pesos se entrenaron con normalizacion '{modo_de_checkpoint(ck)}'; "
+                  f"esta corrida usa '{modo_normalizacion}'")
 
     info = {
         "dispositivo": str(dev),
@@ -582,6 +601,7 @@ def construir_entrenador(
         # leer el config.yaml de cada muestra solo para informar: con 30k son ~1 min
         "fps_train": sorted(set(train.fps())) if len(train) <= 5000 else "(no leido: >5000 muestras)",
         "fps_excluido": fps_excluido,
+        "modo_normalizacion": modo_normalizacion,
         "muestras_por_epoca": sampler_train.muestras_por_epoca or len(train),
         "lotes_por_epoca": len(sampler_train),
         "pasos_optimizador_por_epoca": pasos_por_epoca,

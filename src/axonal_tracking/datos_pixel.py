@@ -47,6 +47,8 @@ from axonal_tracking.etiquetas_deteccion import (
 from axonal_tracking.parametros import PIXEL_SIZE_UM
 
 __all__ = [
+    "MODOS_NORMALIZACION",
+    "MODO_NORMALIZACION_DEFAULT",
     "DatasetKymografos",
     "LoteEmpaquetado",
     "MuestraPixel",
@@ -54,6 +56,7 @@ __all__ = [
     "agrupar_por_tokens",
     "collate_empaquetado",
     "construir_targets",
+    "modo_de_checkpoint",
     "normalizar_kymografo",
 ]
 
@@ -71,9 +74,22 @@ __all__ = [
 # trayectoria (`evaluacion.clasificar_por_angulo`).
 MIN_DESPLAZAMIENTO_PX = MIN_DESPLAZAMIENTO_PX_MOVIL
 PERCENTILES_CONTRASTE = (50.0, 99.8)  # mismo criterio que preprocesamiento.frame_a_rgb_uint8
+# Normalizacion de ENTRADA del modelo (`plan/kymorope-preprocessing.md`). Es parte del
+# modelo: un checkpoint solo es valido con el modo con el que se entreno, que queda en su
+# `plan` (`modo_de_checkpoint`).
+#   "p50_clip"  p50 -> 0, p99.8 -> 1, recortado a [0, 1]. Todos los checkpoints hasta el
+#               2026-10-08. El recorte pone en 0 la mitad de la imagen, y con ella las
+#               trazas tenues que caen en zonas mas oscuras que la mediana global: medido
+#               en Kymograph_307, el 30% de los puntos visibles del tramo final de la
+#               particula 7 del laboratorio.
+#   "p50"       la misma escala sin recortar (~[-0.3, 1.2]): no borra nada.
+MODOS_NORMALIZACION = ("p50_clip", "p50")
+MODO_NORMALIZACION_DEFAULT = "p50_clip"
 # Formato del cache de disco. Entra en el nombre de su carpeta (`_firma_cache`): cambiarlo,
 # o cambiar el umbral de movil o la escala de pixel, apunta a una carpeta nueva y el cache
-# se reconstruye solo en vez de servir targets viejos en silencio.
+# se reconstruye solo en vez de servir targets viejos en silencio. El cache guarda solo
+# TARGETS: el kimografo se lee crudo y se normaliza al cargar (ver `_guardar_cache`), asi
+# que el modo de normalizacion no entra en la firma.
 VERSION_CACHE = 2
 
 # Clases del head de trackness (SS2.5)
@@ -92,19 +108,33 @@ class TargetsPixel:
     n_instancias: int
 
 
-def normalizar_kymografo(kymo: np.ndarray) -> np.ndarray:
-    """`(T, L)` cualquier dtype -> float32 en [0, 1] por estiramiento p50-p99.8.
+def normalizar_kymografo(kymo: np.ndarray, modo: str = MODO_NORMALIZACION_DEFAULT) -> np.ndarray:
+    """`(T, L)` cualquier dtype -> float32 por estiramiento p50-p99.8 (p50 -> 0, p99.8 -> 1).
 
     Mismo criterio de contraste que `preprocesamiento.frame_a_rgb_uint8` y que
     `etiquetas_deteccion.kymografo_a_rgb_uint8`: anclado al fondo, no al minimo
     absoluto. Se normaliza POR KYMOGRAFO porque el bit-depth y el brillo varian
     entre sesiones (mismo argumento que la normalizacion de features de SS5.2 de
-    `atencion.py`)."""
+    `atencion.py`). `modo`: ver `MODOS_NORMALIZACION` -- "p50_clip" recorta a [0, 1],
+    "p50" no recorta."""
+    if modo not in MODOS_NORMALIZACION:
+        raise ValueError(f"modo de normalizacion desconocido: {modo!r} (validos: {MODOS_NORMALIZACION})")
     k = np.asarray(kymo, dtype=np.float32)
     lo, hi = np.percentile(k, PERCENTILES_CONTRASTE)
     if hi <= lo:
         hi = lo + 1.0
-    return np.clip((k - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+    x = (k - lo) / (hi - lo)
+    if modo == "p50_clip":
+        x = np.clip(x, 0.0, 1.0)
+    return x.astype(np.float32)
+
+
+def modo_de_checkpoint(ck: dict) -> str:
+    """Modo de normalizacion con el que se entreno un checkpoint (`torch.load` de
+    `TrainerKymoRoPE.save_checkpoint`). Los anteriores al 2026-10-08 no lo guardan y se
+    entrenaron todos con "p50_clip". La inferencia DEBE usar este modo: evaluar un modelo
+    con otra normalizacion que la de su entrenamiento no es una corrida valida."""
+    return (ck.get("plan") or {}).get("modo_normalizacion", "p50_clip")
 
 
 def _theta_por_particula(
@@ -192,7 +222,7 @@ class MuestraPixel:
     """Una muestra lista para el modelo. Todo float32 (MPS no soporta float64)."""
 
     nombre: str
-    kymo: torch.Tensor  # (1, T, L) float32 en [0, 1]
+    kymo: torch.Tensor  # (1, T, L) float32; [0, 1] con "p50_clip", ~[-0.3, 1.2] con "p50"
     trackness: torch.Tensor  # (T, L) int8  {0, 1, 2}
     instancias: torch.Tensor  # (T, L) int16, 0 = fondo
     theta: torch.Tensor  # (2, T, L) float16
@@ -224,7 +254,11 @@ class DatasetKymografos(Dataset):
     movil y escala de pixel (cambiar cualquiera apunta a otra carpeta), y cada archivo
     lleva en el nombre la huella de SUS archivos fuente (`_huella_fuente`), asi que una
     muestra cambiada -- o una de otro dataset con el mismo `sample_NNNNN` -- no reusa una
-    entrada ajena. Agregar muestras al dataset solo construye las nuevas."""
+    entrada ajena. Agregar muestras al dataset solo construye las nuevas.
+
+    `modo_normalizacion` (ver `MODOS_NORMALIZACION`) se aplica al cargar, sobre el
+    `kymograph.tif` crudo: el cache no guarda el kimografo, asi que un mismo cache sirve
+    para cualquier modo."""
 
     def __init__(
         self,
@@ -237,10 +271,16 @@ class DatasetKymografos(Dataset):
         subconjunto: int | None = None,
         cache_targets: bool = False,
         cache_dir: Path | str | None = None,
+        modo_normalizacion: str = MODO_NORMALIZACION_DEFAULT,
     ):
+        if modo_normalizacion not in MODOS_NORMALIZACION:
+            raise ValueError(
+                f"modo_normalizacion desconocido: {modo_normalizacion!r} (validos: {MODOS_NORMALIZACION})"
+            )
         self.raiz = Path(raiz_split)
         self.pixel_scale_um = pixel_scale_um
         self.min_desplazamiento_px = min_desplazamiento_px
+        self.modo_normalizacion = modo_normalizacion
         self.cache_dir = Path(cache_dir) / self._firma_cache() if cache_dir else None
         self.cache_targets = cache_targets
         self._cache: dict[int, MuestraPixel] = {}
@@ -325,7 +365,7 @@ class DatasetKymografos(Dataset):
         return self._rutas[i]
 
     def _construir(self, i: int) -> dict:
-        """Arrays de una muestra: lo caro (rasterizar + dilatar ~30 trazas, ~0.064 s)
+        """Targets de una muestra: lo caro (rasterizar + dilatar ~30 trazas, ~0.064 s)
         y lo unico que vale la pena cachear a disco."""
         return _arrays_muestra(self.dirs[i], self.pixel_scale_um, self.min_desplazamiento_px)
 
@@ -364,17 +404,23 @@ class DatasetKymografos(Dataset):
         if i in self._cache:
             return self._cache[i]
 
+        import tifffile
+
         d = self.dirs[i]
         ruta = self._ruta_cache(i)
         if ruta is not None and ruta.exists():
             with np.load(ruta) as z:
-                a = {k: z[k] for k in z.files}
+                # las entradas escritas antes del 2026-10-08 traen tambien "kymo" (ya
+                # normalizado "p50_clip", en float16): se ignora y no se descomprime
+                a = {k: z[k] for k in z.files if k != "kymo"}
         else:
             a = self._construir(i)
             if ruta is not None:
                 _guardar_cache(ruta, a)
 
-        kymo = a["kymo"].astype(np.float32)  # en cache va en float16
+        # El kimografo sale SIEMPRE del tif crudo (~1 ms) y se normaliza aca, con el modo
+        # de este dataset: asi el cache no fija la normalizacion.
+        kymo = normalizar_kymografo(tifffile.imread(d / "kymograph.tif"), self.modo_normalizacion)
         tg = TargetsPixel(
             trackness=a["trackness"], instancias=a["instancias"], theta=a["theta"],
             mask_pull=a["mask_pull"], mask_theta=a["mask_theta"],
@@ -418,19 +464,19 @@ def _huella_fuente(dir_muestra: Path) -> str:
 
 
 def _arrays_muestra(dir_muestra: Path, pixel_scale_um: float, min_desplazamiento_px: float) -> dict:
-    """Kimografo normalizado + targets de una muestra, como arrays. A nivel de modulo (no
-    metodo) para que `ProcessPoolExecutor` lo pueda serializar."""
+    """Targets de una muestra, como arrays (sin el kimografo: ver `_guardar_cache`). A
+    nivel de modulo (no metodo) para que `ProcessPoolExecutor` lo pueda serializar."""
     import tifffile
 
-    kymo = normalizar_kymografo(tifffile.imread(dir_muestra / "kymograph.tif"))
+    with tifffile.TiffFile(dir_muestra / "kymograph.tif") as tif:
+        forma = tuple(tif.pages[0].shape[:2])
     tg = construir_targets(
         pd.read_csv(dir_muestra / "positions.csv"),
-        kymo.shape,
+        forma,
         pixel_scale_um=pixel_scale_um,
         min_desplazamiento_px=min_desplazamiento_px,
     )
     return {
-        "kymo": kymo,
         "trackness": tg.trackness,
         "instancias": tg.instancias,
         "theta": tg.theta,
@@ -442,19 +488,23 @@ def _arrays_muestra(dir_muestra: Path, pixel_scale_um: float, min_desplazamiento
 
 
 def _guardar_cache(ruta: Path, arrays: dict) -> None:
-    """Formato v2 del cache: comprimido, kimografo y theta en float16.
+    """Formato v2 del cache: comprimido, theta en float16, SIN kimografo.
 
     v1 guardaba sin comprimir y en float32: ~16 B/px, ~144 GB proyectados para 30 000
-    muestras. Las mascaras son casi todo ceros y comprimen muy bien; el kimografo ya esta
-    normalizado a [0, 1], donde float16 (paso ~5e-4) sobra -- el modelo lo recibe en bf16
-    bajo autocast igual. `theta` es seno/coseno y el modelo ya lo usaba en float16.
+    muestras. Las mascaras son casi todo ceros y comprimen muy bien. `theta` es
+    seno/coseno y el modelo ya lo usaba en float16.
+
+    Hasta el 2026-10-08 guardaba ademas el kimografo ya normalizado ("p50_clip", en
+    float16). Eso ataba el cache a una normalizacion, y la mitad recortada de la imagen no
+    se puede recuperar de ahi. Ahora el kimografo se lee del tif en cada `__getitem__`; las
+    entradas viejas siguen sirviendo (su "kymo" se ignora), por eso la version no cambia.
 
     Escribe a un temporal y renombra: si el proceso muere a mitad de camino no queda un
     `.npz` truncado que `ruta.exists()` tome por valido."""
     import os
 
     datos = dict(arrays)
-    datos["kymo"] = np.asarray(datos["kymo"], dtype=np.float16)
+    datos.pop("kymo", None)
     datos["theta"] = np.asarray(datos["theta"], dtype=np.float16)
     ruta.parent.mkdir(parents=True, exist_ok=True)
     temporal = ruta.with_name(f"{ruta.stem}.{os.getpid()}.tmp")
